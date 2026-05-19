@@ -106,10 +106,12 @@ python -m src.cli /path/to/video/folder
 | `--top-k K` | 10 | 每次搜索保留的候选条数上限 |
 | `--max-deepsearch-rounds N` | 5 | 每个溯源组的最大 DeepSearch 轮数 |
 | `--max-reflect-rounds N` | 3 | 搜索失败时 Reflect 上限 |
-| `--total-sample-frames N` | 64 | COT 分析的采样帧数 |
+| `--total-sample-frames N` | 64 | COT / 细筛 / sufficiency 的输入视频采样帧数（缓存 `{id}_h480_n64`） |
 | `--candidate-sample-frames N` | 64 | 细对齐 / 抽取时的候选视频采样帧数 |
-| `--coarse-sample-frames N` | 16 | 粗筛采样帧数 |
-| `--query-temperature` | 0.4 | 若干 VLM 调用的采样温度 |
+| `--coarse-sample-frames N` | 16 | 粗筛：输入与候选各 16 帧（输入缓存 `{id}_h480_n16`） |
+| `--reasoning-model` | `$REASONING_MODEL` 或 `$OPENAI_MODEL` | COT / Reflect 专用模型；粗筛 / 细筛仍用 `$OPENAI_MODEL` |
+| `--frame-resize-workers N` | 16 | 单次 ffmpeg 扫片抽帧后，并行缩放 JPEG 到目标高度的线程数（非多路解码） |
+| `--query-temperature` | 0.0 | 若干 VLM 调用的采样温度 |
 | `--download-dir` | `downloads`（相对当前工作目录解析） | 候选视频下载目录 |
 | `--use-cot` / `--no-cot` | 开 | 关闭 COT 时用文件名兜底关键词 |
 | `--judge-model` | `$OPENAI_MODEL` | Judge 阶段模型 |
@@ -128,6 +130,16 @@ _results/
 └── logs/
     └── run_<时间戳>_<视频id>.log
 ```
+
+### 帧缓存（`.frame_cache/`）
+
+抽帧结果持久化在项目根目录 `.frame_cache/{video_id}_h{height}_n{frames}/`，输入视频与候选视频共用同一命名规则。典型目录：
+
+- `{input_id}_h480_n64` — COT、细筛、sufficiency、Reflect
+- `{input_id}_h480_n16` — 粗筛输入侧（16 帧）
+- `{candidate_id}_h480_n16` — 粗筛候选侧
+
+命中缓存时跳过 ffmpeg；未命中时单次 ffmpeg 顺序解码抽帧，再并行缩放到目标高度（默认 16 线程）。
 
 ### 仅检索模式（Search-only）
 
@@ -160,13 +172,5 @@ python -m src.cli /path/to/videos --search-only
 └── README.md
 ```
 
-## 推送到远端（重写历史）
 
-若要把本目录作为**仓库根目录**并**覆盖 GitHub 上旧提交**，在已配置好远端与登录的前提下执行：
-
-```bash
-git push -u origin main --force
-```
-
-`--force` 会丢弃远端 `main` 上原有的提交记录，请确保协作者已知晓。
 

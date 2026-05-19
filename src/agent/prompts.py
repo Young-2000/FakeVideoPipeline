@@ -339,7 +339,7 @@ CRITICAL RULES:
 - If the current evidence mainly highlights that Group A and Group B are from different eras, different shows, different productions, or different contexts, that is evidence of topical relatedness, NOT sufficient source resolution. Keep searching.
 - For MULTI-SOURCE or MULTI-SCENE cases: you need evidence that covers EACH major source family or unresolved scene cluster.
 - Prefer precision over early stopping. It is acceptable to continue searching when the current best evidence is only "related but not same-source enough."
-- If the round status says the NEXT round will be the FINAL round and the evidence is still insufficient, you MUST output one concrete, non-empty, immediately usable `next_keyword`. Do not leave `next_keyword` empty in that case.
+- If the round status says this is the FINAL round, you MUST set `is_sufficient=true`, leave `missing_description` and `next_keyword` empty, and do not request another search.
 
 TASK 2 — NEXT KEYWORD (only if NOT sufficient): Generate the SINGLE best YouTube search query to find the next missing original source.
 
@@ -348,7 +348,6 @@ THINK STEP BY STEP for keyword generation:
 2. What specific distinguishing cue would most likely retrieve useful evidence for it?
 3. Generate ONE search query (5-12 words) using the strongest identifying anchor available.
 4. Prefer a query that could plausibly match a real YouTube title or high-value search phrase.
-5. If the NEXT round will be the FINAL round, optimize for the highest-value decisive query rather than a conservative one.
 
 OUTPUT JSON FORMAT:
 {{

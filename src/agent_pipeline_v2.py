@@ -5,7 +5,7 @@ Replaces the flat search+verify loop with a two-stage retrieval pipeline:
   2. Single VLM COT call -> overlay triage + temporal analysis + keyword generation
   3. Deepsearch loop (per source group, serial):
      a. Search 1 keyword -> 1 candidate video
-     b. Coarse filter: sample 16 frames, VLM judges relevance
+     b. Coarse filter: 16 input + 16 candidate frames, VLM judges relevance
      c. Fine filter: sample 64 frames, VLM extracts 3-5 forgery points
      d. Sufficiency check: VLM judges if evidence is complete
      e. If not sufficient, reflect -> new keyword -> repeat (max N rounds)
@@ -67,7 +67,7 @@ class VisualRetrievalAgentV2:
         download_output_dir: str = "downloads",
         oracle_manifest_path: str | None = None,
         search_only: bool = False,
-        query_temperature: float = 0.4,
+        query_temperature: float = 0.0,
         infra_consecutive_threshold: int = 3,
         verbose: bool = True,
         # Deepsearch-specific params
@@ -75,11 +75,20 @@ class VisualRetrievalAgentV2:
         coarse_sample_frames: int = 16,
         use_cot: bool = True,
         save_run_trace: bool = False,
+        reasoning_model: str | None = None,
+        frame_resize_workers: int | None = None,
     ) -> None:
-        from src.utils.config import OPENAI_MODEL, get_llm_client
+        from src.utils.config import OPENAI_MODEL, REASONING_MODEL, get_llm_client
 
         self.client = get_llm_client()
         self.model = OPENAI_MODEL
+        self.reasoning_model = reasoning_model or REASONING_MODEL or OPENAI_MODEL
+        if frame_resize_workers is None:
+            from src.utils.frame_sampling import default_frame_resize_workers
+
+            self.frame_resize_workers = default_frame_resize_workers()
+        else:
+            self.frame_resize_workers = max(1, int(frame_resize_workers))
         self.top_k = top_k
         self.total_sample_frames = max(1, int(total_sample_frames))
         if candidate_sample_frames is None:
@@ -178,7 +187,7 @@ class VisualRetrievalAgentV2:
         contents = _build_multimodal_content(PROMPT_COT_RETRIEVAL_V3, image_paths=frame_paths)
         raw, tokens = call_vlm_with_retry(
             self.client,
-            self.model,
+            self.reasoning_model,
             contents,
             max_retries=3,
             temperature=self.query_temperature,
@@ -268,7 +277,7 @@ class VisualRetrievalAgentV2:
         contents = _build_multimodal_content(prompt, image_paths=frame_paths)
         raw, tokens = call_vlm_with_retry(
             self.client,
-            self.model,
+            self.reasoning_model,
             contents,
             max_retries=3,
             temperature=self.query_temperature,
@@ -367,6 +376,7 @@ class VisualRetrievalAgentV2:
         session: SessionState,
         tools: AgentTools,
         input_frame_paths: list[str],
+        input_coarse_frame_paths: list[str],
         cache_root: str,
         cot_physical_observations: str = "",
         cot_logical_analysis: str = "",
@@ -384,7 +394,12 @@ class VisualRetrievalAgentV2:
         if input_frame_paths:
             self._log(
                 f"[Sampling] input frames for deepsearch: {len(input_frame_paths)} reused "
-                f"from {Path(input_frame_paths[0]).parent} (Group A in every coarse/fine call)"
+                f"from {Path(input_frame_paths[0]).parent} (fine/sufficiency/reflect)"
+            )
+        if input_coarse_frame_paths:
+            self._log(
+                f"[Sampling] input coarse frames: {len(input_coarse_frame_paths)} reused "
+                f"from {Path(input_coarse_frame_paths[0]).parent}"
             )
         collected_points: list[dict[str, Any]] = []
         evidence_videos: list[dict[str, str]] = []
@@ -397,7 +412,13 @@ class VisualRetrievalAgentV2:
         wrong_titles: list[str] = []
         all_prev_queries: list[str] = []
 
-        for round_num in range(1, self.max_deepsearch_rounds + 1):
+        round_num = 0
+        while True:
+            round_num += 1
+            if round_num > self.max_deepsearch_rounds:
+                self._log("[DeepSearch] exceeded max_deepsearch_rounds; hard stop")
+                break
+
             round_trace_entry: dict[str, Any] | None = None
             if run_trace is not None:
                 round_trace_entry = {"round": round_num, "query": current_keyword or ""}
@@ -516,14 +537,17 @@ class VisualRetrievalAgentV2:
                 continue
 
             cand_coarse_cached = bool(coarse_result.get("cached"))
+            coarse_input_paths = (
+                input_coarse_frame_paths if input_coarse_frame_paths else input_frame_paths
+            )
             self._log(
-                f"[Sampling] coarse VLM: {len(input_frame_paths)} input frames (reused) + "
+                f"[Sampling] coarse VLM: {len(coarse_input_paths)} input frames (reused) + "
                 f"{len(coarse_result['frame_paths'])} candidate frames"
                 f"{' (candidate frame_cache hit)' if cand_coarse_cached else ''}"
             )
 
             relevance = tools.check_coarse_relevance(
-                input_frame_paths,
+                coarse_input_paths,
                 coarse_result["frame_paths"],
                 physical_observations=cot_physical_observations,
                 logical_analysis=cot_logical_analysis,
@@ -731,7 +755,14 @@ class VisualRetrievalAgentV2:
                     "reasoning": str(next_step.get("reasoning") or ""),
                     "missing_description": str(next_step.get("missing_description") or ""),
                     "next_keyword": str(next_step.get("next_keyword") or ""),
+                    "forced_stop": bool(next_step.get("forced_stop")),
                 }
+
+            if next_step.get("forced_stop"):
+                self._log("[DeepSearch] forced stop after exceeding max rounds")
+                if round_trace_entry is not None:
+                    round_trace_entry["stop_reason"] = "exceeded_max_rounds"
+                break
 
             if next_step["is_sufficient"]:
                 if not source_like_videos:
@@ -833,7 +864,7 @@ class VisualRetrievalAgentV2:
         self._log("========== Deepsearch Agent v2 run started ==========")
         self._log(f"Input video: {video_path}")
         self._log(
-            f"Config: model={self.model}, "
+            f"Config: reasoning_model={self.reasoning_model}, vlm_model={self.model}, "
             f"total_sample_frames={self.total_sample_frames}, "
             f"top_k={self.top_k}, "
             f"candidate_sample_frames={self.candidate_sample_frames}, "
@@ -843,7 +874,8 @@ class VisualRetrievalAgentV2:
             f"max_reflect_rounds={self.max_reflect_rounds}, "
             f"query_temperature={self.query_temperature}, "
             f"use_cot={self.use_cot}, "
-            f"search_only={self.search_only}"
+            f"search_only={self.search_only}, "
+            f"frame_resize_workers={self.frame_resize_workers}"
         )
 
         # Token tracking
@@ -893,7 +925,37 @@ class VisualRetrievalAgentV2:
                 prefix="frame",
                 target_height=self.candidate_video_height,
                 cache_dir=frame_cache_dir,
+                max_workers=self.frame_resize_workers,
+                log_fn=self._log,
             )
+            coarse_cache_dir = str(
+                resolve_frame_cache_dir(
+                    frame_cache_root,
+                    input_video_id,
+                    height=self.candidate_video_height,
+                    num_frames=self.coarse_sample_frames,
+                )
+            )
+            input_coarse_frame_paths, coarse_cache_hit = uniform_sample_frames(
+                video_path,
+                num_frames=self.coarse_sample_frames,
+                output_dir=sampled_root,
+                prefix="frame",
+                target_height=self.candidate_video_height,
+                cache_dir=coarse_cache_dir,
+                max_workers=self.frame_resize_workers,
+                log_fn=self._log,
+            )
+            if coarse_cache_hit:
+                self._log(
+                    f"[Sampling] frame_cache hit (input coarse): {len(input_coarse_frame_paths)} frames from "
+                    f"{coarse_cache_dir}"
+                )
+            else:
+                self._log(
+                    f"[Sampling] frame_cache miss (input coarse): ffmpeg extracted "
+                    f"{len(input_coarse_frame_paths)} frames to {coarse_cache_dir}"
+                )
             if frame_cache_hit:
                 self._log(
                     f"[Sampling] frame_cache hit (input): {len(frame_paths)} frames from "
@@ -932,6 +994,7 @@ class VisualRetrievalAgentV2:
             tools = AgentTools(
                 client=self.client,
                 model=self.model,
+                frame_resize_workers=self.frame_resize_workers,
                 candidate_sample_frames=self.candidate_sample_frames,
                 prompts={
                     "extract": "",
@@ -1045,6 +1108,7 @@ class VisualRetrievalAgentV2:
                 session=session,
                 tools=tools,
                 input_frame_paths=frame_paths,
+                input_coarse_frame_paths=input_coarse_frame_paths,
                 cache_root=cache_root,
                 cot_physical_observations=cot_phys,
                 cot_logical_analysis=cot_logic,

@@ -15,6 +15,8 @@ PIPELINE_LOG_DIR = Path(
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://openrouter.ai/api/v1")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "google/gemini-2.5-pro")
+# Optional: COT / Reflect reasoning model (falls back to OPENAI_MODEL)
+REASONING_MODEL = os.getenv("REASONING_MODEL", "").strip() or None
 SERPAPI_KEY = os.getenv("SERPAPI_KEY", "").strip()
 
 MAX_COMPRESSED_VIDEO_BYTES = int(os.getenv("MAX_COMPRESSED_VIDEO_BYTES", str(18 * 1024 * 1024)))

@@ -150,7 +150,7 @@ def call_vlm_with_retry(
     contents: list[Any],
     *,
     max_retries: int = 3,
-    temperature: float = 0.2,
+    temperature: float = 0.0,
     json_mode: bool = True,
     retry_backoff_sec: float = 1.5,
     logger: Any = None,
@@ -244,10 +244,12 @@ def uniform_sample_frames(
     jpeg_quality: int = 85,
     target_height: int | None = None,
     cache_dir: str | Path | None = None,
+    max_workers: int | None = None,
+    log_fn=None,
 ) -> tuple[list[str], bool]:
-    """Uniformly sample `num_frames` from `video_path` via ffmpeg (sequential decode).
+    """Uniformly sample `num_frames` from `video_path` via ffmpeg (single sequential decode).
 
-    If `target_height` is set, frames are scaled to that height (width even, proportional).
+    If `target_height` is set, frames are resized to that height in parallel after extract.
 
     If `cache_dir` is set, cached ``{prefix}_{frame_idx}.jpg`` files are reused on hit.
 
@@ -270,6 +272,8 @@ def uniform_sample_frames(
         prefix=prefix,
         target_height=target_height,
         jpeg_quality=jpeg_quality,
+        max_workers=max_workers,
+        log_fn=log_fn,
     )
     if not saved:
         raise ValueError(f"No frames extracted from video: {video_path}")

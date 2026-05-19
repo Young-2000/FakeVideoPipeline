@@ -148,7 +148,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=64,
         help="Frames sampled from the input video (default: 64).",
     )
-    parser.add_argument("--query-temperature", type=float, default=0.4)
+    parser.add_argument("--query-temperature", type=float, default=0.0)
     parser.add_argument(
         "--download-dir",
         type=str,
@@ -186,6 +186,24 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=16,
         help="Frames sampled for coarse relevance filter (default 16).",
+    )
+    parser.add_argument(
+        "--reasoning-model",
+        type=str,
+        default=None,
+        help=(
+            "Model for COT / Reflect reasoning (default: REASONING_MODEL env or OPENAI_MODEL). "
+            "Coarse/fine/sufficiency VLM calls use OPENAI_MODEL."
+        ),
+    )
+    parser.add_argument(
+        "--frame-resize-workers",
+        type=int,
+        default=None,
+        help=(
+            "Thread pool size for parallel JPEG resize after single-pass ffmpeg extract "
+            "(default: 16, or FRAME_RESIZE_WORKERS env). Does not spawn multiple decoders."
+        ),
     )
     parser.add_argument(
         "--use-cot",
@@ -909,6 +927,8 @@ def main() -> None:
         coarse_sample_frames=args.coarse_sample_frames,
         use_cot=args.use_cot,
         save_run_trace=args.save_run_trace,
+        reasoning_model=args.reasoning_model,
+        frame_resize_workers=args.frame_resize_workers,
     )
     print(
         f"[Orchestrator] deepsearch hyperparameters: "
@@ -920,7 +940,10 @@ def main() -> None:
         f"max_deepsearch_rounds={args.max_deepsearch_rounds}, "
         f"max_reflect_rounds={args.max_reflect_rounds}, "
         f"query_temperature={args.query_temperature}, "
-        f"use_cot={args.use_cot}",
+        f"use_cot={args.use_cot}, "
+        f"reasoning_model={agent.reasoning_model}, "
+        f"vlm_model={agent.model}, "
+        f"frame_resize_workers={agent.frame_resize_workers}",
         flush=True,
     )
 

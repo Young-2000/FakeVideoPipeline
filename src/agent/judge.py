@@ -22,7 +22,7 @@ from src.utils.token_usage import (
 
 
 DEFAULT_JUDGE_MODELS = [
-    "gpt-5.5",
+    "gpt-5.4",
     "gemini-3.1-pro",
     "claude-sonnet-4.6",
 ]

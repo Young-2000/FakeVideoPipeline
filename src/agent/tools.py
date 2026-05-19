@@ -182,10 +182,17 @@ class AgentTools:
         logger,
         coarse_frames: int = 16,
         dense_frames: int = 16,
-        query_temperature: float = 0.4,
+        query_temperature: float = 0.0,
+        frame_resize_workers: int | None = None,
     ) -> None:
         self.client = client
         self.model = model
+        if frame_resize_workers is None:
+            from src.utils.frame_sampling import default_frame_resize_workers
+
+            self.frame_resize_workers = default_frame_resize_workers()
+        else:
+            self.frame_resize_workers = max(1, int(frame_resize_workers))
         self.candidate_sample_frames = candidate_sample_frames
         self.candidate_video_height = max(1, int(candidate_video_height))
         self.prompts = prompts
@@ -246,7 +253,7 @@ class AgentTools:
         frame_paths: list[str],
         prompt: str,
         *,
-        temperature: float = 0.2,
+        temperature: float = 0.0,
     ) -> dict[str, Any]:
         contents = _build_multimodal_content(prompt, image_paths=frame_paths)
         raw, tokens = call_vlm_with_retry(
@@ -839,6 +846,8 @@ class AgentTools:
                 target_dir,
                 prefix="frame",
                 target_height=self.candidate_video_height,
+                max_workers=self.frame_resize_workers,
+                log_fn=self.log,
             )
         except (FileNotFoundError, RuntimeError, ValueError) as exc:
             return {
@@ -1030,7 +1039,7 @@ class AgentTools:
             self.model,
             contents,
             max_retries=3,
-            temperature=0.2,
+            temperature=0.0,
             json_mode=True,
             logger=self.log,
             log_prefix="[VLM] ",
@@ -1069,7 +1078,7 @@ class AgentTools:
             self.model,
             contents,
             max_retries=3,
-            temperature=0.2,
+            temperature=0.0,
             json_mode=True,
             logger=self.log,
             log_prefix="[VLM] ",
@@ -1108,6 +1117,20 @@ class AgentTools:
         Text-only VLM call (no frames).  Decides: (1) is evidence sufficient,
         (2) if not, what keyword to search next.
         """
+        if (
+            current_round is not None
+            and max_rounds is not None
+            and current_round > max_rounds
+        ):
+            return {
+                "reasoning": "Exceeded max_deepsearch_rounds; hard stop.",
+                "is_sufficient": True,
+                "missing_description": "",
+                "next_keyword": "",
+                "tokens": {},
+                "forced_stop": True,
+            }
+
         # Format collected points
         if collected_points:
             pts_lines = []
@@ -1133,21 +1156,17 @@ class AgentTools:
         q_str = "\n".join(f"  - {q}" for q in prev_queries) if prev_queries else "  (none)"
         entities_summary = json.dumps(entities or {}, ensure_ascii=False)
         if current_round is not None and max_rounds is not None:
-            if current_round == max_rounds - 1:
+            if current_round == max_rounds:
                 round_status = (
                     f"Current round: {current_round}/{max_rounds}. "
-                    f"The NEXT round ({max_rounds}/{max_rounds}) will be the FINAL round. "
-                    "If evidence is still insufficient, you must output one concrete non-empty next_keyword for that final attempt."
-                )
-            elif current_round >= max_rounds:
-                round_status = (
-                    f"Current round: {current_round}/{max_rounds}. "
-                    "This is already the FINAL round."
+                    "This is the FINAL round. You MUST set is_sufficient=true, "
+                    "summarize the evidence collected so far, and leave next_keyword empty. "
+                    "Do not request another search."
                 )
             else:
                 round_status = (
                     f"Current round: {current_round}/{max_rounds}. "
-                    f"There are {max_rounds - current_round} round(s) remaining including the next one."
+                    f"There are {max_rounds - current_round} round(s) remaining after this decision."
                 )
         else:
             round_status = "Round status unavailable."
@@ -1172,7 +1191,7 @@ class AgentTools:
         raw, _tokens = call_vlm_with_retry(
             client, OPENAI_MODEL,
             [{"type": "text", "text": prompt}],
-            temperature=0.2, logger=self.log,
+            temperature=0.0, logger=self.log,
         )
         data = extract_json_from_text(raw)
         return {
@@ -1181,4 +1200,5 @@ class AgentTools:
             "missing_description": str(data.get("missing_description") or "").strip(),
             "next_keyword": str(data.get("next_keyword") or "").strip(),
             "tokens": _tokens or {},
+            "forced_stop": False,
         }

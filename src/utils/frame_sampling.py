@@ -1,11 +1,34 @@
-"""Frame extraction via ffmpeg select filter (sequential decode, no OpenCV seek)."""
+"""Frame extraction: single-pass ffmpeg decode; optional parallel resize to target height."""
 
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+
+import cv2
+
+LogFn = Callable[[str], None] | None
+
+
+def default_frame_resize_workers() -> int:
+    """Default thread count for parallel frame resize (not ffmpeg decode)."""
+    raw = os.environ.get("FRAME_RESIZE_WORKERS", "16").strip()
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 16
+
+
+def _log_msg(log_fn: LogFn, msg: str) -> None:
+    if log_fn is not None:
+        log_fn(msg)
+    else:
+        print(msg, flush=True)
 
 
 def find_ffmpeg() -> str:
@@ -102,6 +125,61 @@ def _jpeg_qscale(jpeg_quality: int) -> int:
     return max(1, min(31, int(round(q))))
 
 
+def _resize_frame_file(path: str, target_height: int, jpeg_quality: int) -> None:
+    """Resize one JPEG in place to ``target_height`` (width even, proportional)."""
+    img = cv2.imread(path)
+    if img is None:
+        raise RuntimeError(f"Cannot read frame image: {path}")
+    h, w = img.shape[:2]
+    th = int(target_height)
+    if h > th:
+        new_w = max(2, int(round(w * th / h)))
+        if new_w % 2:
+            new_w += 1
+        img = cv2.resize(img, (new_w, th), interpolation=cv2.INTER_AREA)
+    q = max(0, min(100, int(jpeg_quality)))
+    if not cv2.imwrite(path, img, [int(cv2.IMWRITE_JPEG_QUALITY), q]):
+        raise RuntimeError(f"Failed to write resized frame: {path}")
+
+
+def compress_frames_parallel(
+    frame_paths: list[str],
+    target_height: int,
+    *,
+    jpeg_quality: int = 85,
+    max_workers: int | None = None,
+    log_fn: LogFn = None,
+) -> None:
+    """Resize multiple JPEGs in parallel (used after single-pass ffmpeg extract)."""
+    if not frame_paths:
+        return
+    workers = max_workers if max_workers is not None else default_frame_resize_workers()
+    pool_size = 1 if len(frame_paths) == 1 else min(workers, len(frame_paths))
+    _log_msg(
+        log_fn,
+        f"[Sampling] parallel resize: {len(frame_paths)} frames to height<={target_height}, "
+        f"workers={pool_size}",
+    )
+    errors: list[str] = []
+    with ThreadPoolExecutor(max_workers=pool_size) as executor:
+        futures = {
+            executor.submit(_resize_frame_file, p, target_height, jpeg_quality): p
+            for p in frame_paths
+        }
+        for fut in as_completed(futures):
+            path = futures[fut]
+            try:
+                fut.result()
+            except Exception as exc:
+                errors.append(f"{path}: {exc}")
+    if errors:
+        raise RuntimeError(
+            f"parallel frame resize failed ({len(errors)}/{len(frame_paths)}): "
+            + "; ".join(errors[:5])
+            + (" ..." if len(errors) > 5 else "")
+        )
+
+
 def sample_frames_at_indices(
     video_path: str,
     indices: list[int],
@@ -110,8 +188,14 @@ def sample_frames_at_indices(
     *,
     target_height: int | None = None,
     jpeg_quality: int = 85,
+    max_workers: int | None = None,
+    log_fn: LogFn = None,
 ) -> list[str]:
-    """Extract frames at the given frame indices (one ffmpeg pass, sequential decode)."""
+    """Extract frames at given indices with one ffmpeg pass (sequential decode).
+
+    When ``target_height`` is set, frames are extracted at source resolution, then
+    resized in parallel via ``max_workers`` threads (``FRAME_RESIZE_WORKERS``).
+    """
     if not indices:
         return []
     out = Path(out_dir)
@@ -119,14 +203,16 @@ def sample_frames_at_indices(
     ffmpeg = find_ffmpeg()
 
     select_parts = "+".join(f"eq(n\\,{idx})" for idx in indices)
-    vf_parts = [f"select='{select_parts}'"]
-    if target_height is not None:
-        vf_parts.append(f"scale=-2:{int(target_height)}")
-    vf = ",".join(vf_parts)
+    vf = f"select='{select_parts}'"
 
     tmp_pattern = str(out / f"_tmp_{prefix}_%08d.jpg")
     for old in out.glob(f"_tmp_{prefix}_*.jpg"):
         old.unlink(missing_ok=True)
+
+    _log_msg(
+        log_fn,
+        f"[Sampling] ffmpeg sequential extract: {len(indices)} frames from {video_path}",
+    )
 
     cmd = [
         ffmpeg,
@@ -167,6 +253,16 @@ def sample_frames_at_indices(
             dest.unlink()
         tmp.replace(dest)
         saved.append(str(dest))
+
+    if target_height is not None:
+        compress_frames_parallel(
+            saved,
+            int(target_height),
+            jpeg_quality=jpeg_quality,
+            max_workers=max_workers,
+            log_fn=log_fn,
+        )
+
     return saved
 
 
@@ -200,6 +296,8 @@ def sample_frames_uniform(
     jpeg_quality: int = 85,
     total_frames: int | None = None,
     fps: float | None = None,
+    max_workers: int | None = None,
+    log_fn: LogFn = None,
 ) -> list[str]:
     """Uniformly sample ``num_frames`` from ``video_path`` via ffmpeg."""
     if total_frames is None or fps is None:
@@ -213,4 +311,6 @@ def sample_frames_uniform(
         prefix=prefix,
         target_height=target_height,
         jpeg_quality=jpeg_quality,
+        max_workers=max_workers,
+        log_fn=log_fn,
     )

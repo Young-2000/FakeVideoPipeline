@@ -3,3 +3,6 @@ __pycache__/
 downloads/
 _results/
 *.pyc
+.frame_cache/
+
+test

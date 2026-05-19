@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -50,6 +51,7 @@ _DEFAULT_PLAYER_CLIENTS = "web,android"
 # YouTube download trips "Sign in to confirm you're not a bot" / 403. We try deno
 # first (default), then node/bun.
 _JS_RUNTIME_CANDIDATES = ("deno", "node", "bun")
+_DOWNLOAD_TIMEOUT_SECONDS = 240
 
 
 def _detect_js_runtime() -> tuple[str, str] | None:
@@ -175,6 +177,7 @@ class AgentTools:
         client: Any,
         model: str,
         candidate_sample_frames: int,
+        candidate_video_height: int = 480,
         prompts: dict[str, str],
         logger,
         coarse_frames: int = 16,
@@ -184,6 +187,7 @@ class AgentTools:
         self.client = client
         self.model = model
         self.candidate_sample_frames = candidate_sample_frames
+        self.candidate_video_height = max(1, int(candidate_video_height))
         self.prompts = prompts
         self.log = logger
         self.coarse_frames = coarse_frames
@@ -217,7 +221,7 @@ class AgentTools:
         return path
 
     def _ytdlp_common_args(self, *, use_browser_cookies: bool = False) -> list[str]:
-        """Common yt-dlp anti-bot flags shared by search and download."""
+        """Common yt-dlp anti-bot flags for download."""
         args = [
             "--user-agent",
             _DEFAULT_USER_AGENT,
@@ -550,8 +554,8 @@ class AgentTools:
         top_k: int,
     ) -> dict[str, Any]:
         query = query.strip()
-        results = self._search_ytdlp(query, top_k)
-        source = "ytdlp"
+        results = self._search_serpapi(query, top_k)
+        source = "serpapi"
 
         existing_ids = {
             _extract_youtube_id_from_url(rec.url)
@@ -617,12 +621,20 @@ class AgentTools:
         out_template = str(Path(output_dir) / "%(id)s.%(ext)s")
 
         # Single-file mp4 first to avoid merge dependency; merged formats as fallback.
-        format_selector = (
-            "best[ext=mp4][height<=720]/best[ext=mp4]/"
-            "bv*[height<=720]+ba/best[height<=720]/best"
-        )
+        max_height = self.candidate_video_height
+        format_selectors = [
+            (
+                "primary",
+                f"best[ext=mp4][height<={max_height}]/best[ext=mp4]/"
+                f"bv*[height<={max_height}]+ba/best[height<={max_height}]/best",
+            ),
+            (
+                "fallback_lowres",
+                f"worst[ext=mp4][height<={max_height}]/worst[height<={max_height}]/worst",
+            ),
+        ]
 
-        def _build_cmd(use_browser_cookies: bool) -> list[str]:
+        def _build_cmd(use_browser_cookies: bool, format_selector: str) -> list[str]:
             cmd = [
                 "yt-dlp",
                 "--no-playlist",
@@ -640,74 +652,87 @@ class AgentTools:
             return cmd
 
         attempts: list[dict[str, str]] = []
-        first_try = _build_cmd(use_browser_cookies=False)
-        try:
-            subprocess.run(first_try, capture_output=True, text=True, check=True, timeout=120)
-            err: subprocess.CalledProcessError | None = None
-        except subprocess.CalledProcessError as exc:
-            err = exc
-            stderr_tail = (exc.stderr or "").strip()[-500:]
-            attempts.append(
-                {"strategy": "cookies_file", "reason_code": _classify_ytdlp_failure(stderr_tail)}
-            )
-        except subprocess.TimeoutExpired:
-            return {
-                "ok": False,
-                "reason": "download_timeout",
-                "reason_code": "timeout",
-                "attempts": [{"strategy": "cookies_file", "reason_code": "timeout"}],
-            }
-        else:
-            err = None
+        err: subprocess.CalledProcessError | None = None
+        stderr_tail = ""
+        reason_code = "unknown"
+        success = False
 
-        if err is not None:
-            stderr_tail = (err.stderr or "").strip()[-500:]
-            reason_code = _classify_ytdlp_failure(stderr_tail)
-            # Fallback retry with --cookies-from-browser if env-configured and the
-            # failure looks recoverable (auth/bot/age).
+        for selector_name, format_selector in format_selectors:
+            try:
+                subprocess.run(
+                    _build_cmd(use_browser_cookies=False, format_selector=format_selector),
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                    timeout=_DOWNLOAD_TIMEOUT_SECONDS,
+                )
+                success = True
+                break
+            except subprocess.CalledProcessError as exc:
+                err = exc
+                stderr_tail = (exc.stderr or "").strip()[-500:]
+                reason_code = _classify_ytdlp_failure(stderr_tail)
+                attempts.append(
+                    {
+                        "strategy": f"cookies_file:{selector_name}",
+                        "reason_code": reason_code,
+                    }
+                )
+            except subprocess.TimeoutExpired:
+                attempts.append(
+                    {
+                        "strategy": f"cookies_file:{selector_name}",
+                        "reason_code": "timeout",
+                    }
+                )
+                reason_code = "timeout"
+                continue
+
             if (
                 self._cookies_browser
                 and reason_code in {"http_403_bot_check", "age_restricted", "private_video"}
             ):
                 self.log(
                     f"[yt-dlp] retrying download with --cookies-from-browser={self._cookies_browser} "
-                    f"after reason_code={reason_code}"
+                    f"after reason_code={reason_code} selector={selector_name}"
                 )
                 try:
                     subprocess.run(
-                        _build_cmd(use_browser_cookies=True),
+                        _build_cmd(use_browser_cookies=True, format_selector=format_selector),
                         capture_output=True,
                         text=True,
                         check=True,
-                        timeout=120,
+                        timeout=_DOWNLOAD_TIMEOUT_SECONDS,
                     )
-                    err = None
+                    success = True
+                    break
                 except subprocess.CalledProcessError as exc2:
                     err = exc2
-                    stderr_tail2 = (exc2.stderr or "").strip()[-500:]
+                    stderr_tail = (exc2.stderr or "").strip()[-500:]
+                    reason_code = _classify_ytdlp_failure(stderr_tail)
                     attempts.append(
                         {
-                            "strategy": "cookies_from_browser",
-                            "reason_code": _classify_ytdlp_failure(stderr_tail2),
+                            "strategy": f"cookies_from_browser:{selector_name}",
+                            "reason_code": reason_code,
                         }
                     )
-                    stderr_tail = stderr_tail2
-                    reason_code = _classify_ytdlp_failure(stderr_tail2)
                 except subprocess.TimeoutExpired:
-                    return {
-                        "ok": False,
-                        "reason": "download_timeout",
-                        "reason_code": "timeout",
-                        "attempts": attempts + [{"strategy": "cookies_from_browser", "reason_code": "timeout"}],
-                    }
-            if err is not None:
-                return {
-                    "ok": False,
-                    "reason": "download_failed",
-                    "reason_code": reason_code,
-                    "stderr_tail": stderr_tail,
-                    "attempts": attempts,
-                }
+                    attempts.append(
+                        {
+                            "strategy": f"cookies_from_browser:{selector_name}",
+                            "reason_code": "timeout",
+                        }
+                    )
+                    reason_code = "timeout"
+
+        if not success:
+            return {
+                "ok": False,
+                "reason": "download_timeout" if reason_code == "timeout" else "download_failed",
+                "reason_code": reason_code,
+                "stderr_tail": stderr_tail,
+                "attempts": attempts,
+            }
 
         chosen, fail_reason = _pick_downloaded_video(
             output_dir, expected_video_id=video_id
@@ -736,24 +761,34 @@ class AgentTools:
         """Sample frames from a downloaded candidate video. Optional [start_sec, end_sec] window.
 
         If `cache_root` is given, frames are cached under
-        `<cache_root>/<youtube_id>/<prefix>_<window_signature>/` so the same window
-        for the same video is sampled at most once across the run."""
+        ``<cache_root>/{youtube_id}_h{height}_n{num_frames}/`` (same layout as input
+        videos). Downloaded mp4 files live under ``download_output_dir`` and are not
+        removed when the temp workspace is cleaned."""
         if not candidate.downloaded_video_path:
             return {"ok": False, "reason": "candidate_not_downloaded", "reason_code": "candidate_not_downloaded"}
 
-        # Reuse cached frames if available.
+        # Reuse persistent cached frames if available.
         cache_dir: Path | None = None
         if cache_root:
             yid = _extract_youtube_id_from_url(candidate.url) or ""
             if yid:
-                if start_sec is not None and end_sec is not None and end_sec > start_sec:
-                    sig = f"{prefix}_{int(start_sec)}_{int(end_sec)}_{int(num_frames)}"
-                else:
-                    sig = f"{prefix}_full_{int(num_frames)}"
-                cache_dir = Path(cache_root) / yid / sig
+                from src.utils.frame_sampling import resolve_frame_cache_dir
+
+                cache_dir = resolve_frame_cache_dir(
+                    cache_root,
+                    yid,
+                    height=self.candidate_video_height,
+                    num_frames=num_frames,
+                    start_sec=start_sec,
+                    end_sec=end_sec,
+                )
                 if cache_dir.is_dir():
-                    cached = sorted(str(p) for p in cache_dir.glob("*.jpg"))
+                    cached = sorted(str(p) for p in cache_dir.glob("frame_*.jpg"))
                     if cached:
+                        self.log(
+                            f"[Sampling] frame_cache hit ({prefix}): {len(cached)} frames "
+                            f"from {cache_dir} (skipped ffmpeg)"
+                        )
                         return {
                             "ok": True,
                             "frame_paths": cached,
@@ -764,14 +799,20 @@ class AgentTools:
                             "cached": True,
                         }
 
-        cap = cv2.VideoCapture(candidate.downloaded_video_path)
-        if not cap.isOpened():
-            return {"ok": False, "reason": "candidate_open_failed", "reason_code": "decode_failed"}
-        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        fps = float(cap.get(cv2.CAP_PROP_FPS)) or 25.0
-        if total <= 0:
-            cap.release()
-            return {"ok": False, "reason": "candidate_invalid_frame_count", "reason_code": "decode_failed"}
+        from src.utils.frame_sampling import (
+            compute_uniform_indices,
+            probe_video_frame_count,
+            sample_frames_at_indices,
+        )
+
+        try:
+            total, fps = probe_video_frame_count(candidate.downloaded_video_path)
+        except (FileNotFoundError, ValueError, subprocess.SubprocessError) as exc:
+            return {
+                "ok": False,
+                "reason": f"candidate_probe_failed: {exc}",
+                "reason_code": "decode_failed",
+            }
 
         start_idx = 0
         end_idx = total - 1
@@ -786,25 +827,31 @@ class AgentTools:
         if frame_count <= 1:
             indices = [start_idx]
         else:
-            indices = [
-                start_idx + round(i * (window - 1) / (frame_count - 1))
-                for i in range(frame_count)
-            ]
+            rel = compute_uniform_indices(window, frame_count)
+            indices = [start_idx + i for i in rel]
 
         target_dir = cache_dir if cache_dir is not None else Path(output_dir)
         target_dir.mkdir(parents=True, exist_ok=True)
-        out_paths: list[str] = []
-        for idx in indices:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-            ok, frame = cap.read()
-            if not ok:
-                continue
-            p = str(target_dir / f"{prefix}_frame_{idx:08d}.jpg")
-            cv2.imwrite(p, frame)
-            out_paths.append(p)
-        cap.release()
+        try:
+            out_paths = sample_frames_at_indices(
+                candidate.downloaded_video_path,
+                indices,
+                target_dir,
+                prefix="frame",
+                target_height=self.candidate_video_height,
+            )
+        except (FileNotFoundError, RuntimeError, ValueError) as exc:
+            return {
+                "ok": False,
+                "reason": f"candidate_sample_failed: {exc}",
+                "reason_code": "decode_failed",
+            }
         if not out_paths:
             return {"ok": False, "reason": "no_frames_extracted", "reason_code": "decode_failed"}
+        self.log(
+            f"[Sampling] frame_cache miss ({prefix}): ffmpeg extracted {len(out_paths)} frames "
+            f"-> {target_dir}"
+        )
         return {
             "ok": True,
             "frame_paths": out_paths,
@@ -815,103 +862,91 @@ class AgentTools:
             "cached": False,
         }
 
-    def _search_ytdlp(
-        self, query: str, top_k: int, max_retries: int = 3,
+    def _search_serpapi(
+        self, query: str, top_k: int, max_page: int = 3,
     ) -> list[dict[str, Any]]:
-        import time
+        """Search YouTube via Serper API (google.serper.dev)."""
+        import urllib.error
+        import urllib.request
 
-        cmd = [
-            "yt-dlp",
-            f"ytsearch{top_k * 2}:{query}",
-            "--dump-single-json",
-            "--skip-download",
-            "--flat-playlist",
-            "--quiet",
-            "--no-warnings",
-        ]
-        cmd.extend(self._ytdlp_common_args())
-
-        payload = None
-        for attempt in range(max_retries):
-            try:
-                proc = subprocess.run(
-                    cmd, capture_output=True, text=True, check=True, timeout=60,
-                )
-                payload = json.loads(proc.stdout or "{}")
-                entries = payload.get("entries") or []
-                if entries:
-                    break
-                # Empty result — may be a bot check; retry after backoff
-                if attempt < max_retries - 1:
-                    wait = 2 ** attempt * 3  # 3s, 6s
-                    self.log(
-                        f"[yt-dlp] empty result (attempt {attempt + 1}/{max_retries}); "
-                        f"retrying in {wait}s"
-                    )
-                    time.sleep(wait)
-            except subprocess.CalledProcessError as exc:
-                err = (exc.stderr or "").strip()[-400:]
-                if attempt < max_retries - 1:
-                    wait = 2 ** attempt * 3
-                    self.log(
-                        f"[yt-dlp] search failed (attempt {attempt + 1}/{max_retries}): "
-                        f"{err}; retrying in {wait}s"
-                    )
-                    time.sleep(wait)
-                else:
-                    self.log(f"[yt-dlp] search failed after {max_retries} attempts: {err}")
-                    return []
-            except Exception:
-                if attempt < max_retries - 1:
-                    time.sleep(2 ** attempt * 3)
-                else:
-                    return []
-
-        if payload is None:
+        serpapi_key = os.getenv("SERPAPI_KEY", "").strip()
+        if not serpapi_key:
+            self.log("[serpapi] SERPAPI_KEY not set, cannot search")
             return []
 
-        out = []
-        seen = set()
-        skipped = {"shorts": 0, "live": 0, "duration": 0}
-        for entry in payload.get("entries", []) or []:
-            vid = str(entry.get("id") or "").strip()
-            title = str(entry.get("title") or "").strip()
-            url = str(entry.get("url") or "").strip()
-            if vid and "youtube.com" not in url and "youtu.be" not in url:
-                url = f"https://www.youtube.com/watch?v={vid}"
-            if not url or url in seen:
-                continue
-            duration_raw = entry.get("duration")
+        sanitized = re.sub(r'[^\w\s]', '', query)
+        final_query = f"{sanitized} youtube"
+
+        candidates: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        skipped = {"shorts": 0, "live": 0}
+
+        for page in range(1, max_page + 1):
+            if len(candidates) >= top_k:
+                break
+
+            payload = json.dumps({
+                "q": final_query,
+                "num": 10,
+                "page": page,
+                "hl": "en",
+                "gl": "us",
+            }).encode("utf-8")
+
+            headers = {
+                "X-API-KEY": serpapi_key,
+                "Content-Type": "application/json",
+            }
+            req = urllib.request.Request(
+                "https://google.serper.dev/search",
+                data=payload,
+                headers=headers,
+                method="POST",
+            )
+
             try:
-                duration_sec = int(duration_raw) if duration_raw is not None else None
-            except Exception:
-                duration_sec = None
-            duration_text = str(duration_raw) if duration_raw is not None else ""
-            title_lower = title.lower()
-            if "/shorts/" in url.lower() or "#shorts" in title_lower:
-                skipped["shorts"] += 1
-                continue
-            if " live" in title_lower or "[live]" in title_lower or "🔴" in title:
-                skipped["live"] += 1
-                continue
-            if duration_sec is not None and (duration_sec < 10 or duration_sec > 60 * 60):
-                skipped["duration"] += 1
-                continue
-            seen.add(url)
-            out.append(
-                {
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    results = json.loads(resp.read().decode("utf-8"))
+            except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as exc:
+                self.log(f"[serpapi] request failed (page {page}): {exc}")
+                break
+
+            organic = results.get("organic") or results.get("organic_results") or []
+            if not organic:
+                break
+
+            for item in organic:
+                if len(candidates) >= top_k:
+                    break
+                url = str(item.get("link") or "").strip()
+                if not url or url in seen:
+                    continue
+                if "youtube.com" not in url and "youtu.be" not in url:
+                    continue
+                if "watch?v=" not in url and "/shorts/" not in url:
+                    continue
+
+                title = str(item.get("title") or "").strip()
+                title_lower = title.lower()
+                if "/shorts/" in url.lower() or "#shorts" in title_lower:
+                    skipped["shorts"] += 1
+                    continue
+                if " live" in title_lower or "[live]" in title_lower or "🔴" in title:
+                    skipped["live"] += 1
+                    continue
+
+                seen.add(url)
+                candidates.append({
                     "url": url,
                     "title": title,
-                    "channel": str(entry.get("channel") or entry.get("uploader") or "").strip(),
-                    "duration": duration_text,
-                    "upload_date": str(entry.get("upload_date") or "").strip(),
-                }
-            )
-            if len(out) >= top_k:
-                break
+                    "channel": "",
+                    "duration": "",
+                    "upload_date": "",
+                })
+
         if any(skipped.values()):
-            self.log(f"[yt-dlp] filtered candidates: {skipped}")
-        return out
+            self.log(f"[serpapi] filtered candidates: {skipped}")
+        return candidates
 
     # ------------------------------------------------------------------
     # Deepsearch: async search & download
@@ -924,7 +959,7 @@ class AgentTools:
         """Async wrapper: search YouTube for one keyword, return top-1 candidate."""
         import asyncio
 
-        results = await asyncio.to_thread(self._search_ytdlp, query, 1)
+        results = await asyncio.to_thread(self._search_serpapi, query, 1)
         if not results:
             return {"ok": False, "query": query, "candidate_ref": None, "reason": "no_results"}
 
@@ -949,7 +984,7 @@ class AgentTools:
             channel=item.get("channel", ""),
             duration=item.get("duration", ""),
             upload_date=item.get("upload_date", ""),
-            source="ytdlp",
+            source="serpapi",
             query=query,
         )
         session.register_candidate(rec)
@@ -973,47 +1008,73 @@ class AgentTools:
     # ------------------------------------------------------------------
     def check_coarse_relevance(
         self,
+        forged_frame_paths: list[str],
         candidate_frame_paths: list[str],
         *,
         physical_observations: str = "",
-        temporal_analysis: str = "",
+        logical_analysis: str = "",
+        search_intent: str = "",
     ) -> dict[str, Any]:
-        """Send candidate frames + text description to VLM for relevance judgment.
-
-        Only sends the candidate frames (not input frames) to save tokens.
-        The forged video is described via text from COT analysis.
-        """
+        """Coarse relevance over two frame groups: forged vs candidate."""
         prompt = PROMPT_COARSE_RELEVANCE.format(
             physical_observations=physical_observations or "(not available)",
-            temporal_analysis=temporal_analysis or "(not available)",
+            logical_analysis=logical_analysis or "(not available)",
+            search_intent=search_intent or "(not available)",
         )
-        data = self._vlm_json_from_frames(candidate_frame_paths, prompt, temperature=0.2)
+        contents = _build_multimodal_content(
+            prompt + "\n\nFrame groups order:\n- First all images are Group A (forged).\n- Then all images are Group B (candidate).",
+            image_paths=[*forged_frame_paths, *candidate_frame_paths],
+        )
+        raw, _tokens = call_vlm_with_retry(
+            self.client,
+            self.model,
+            contents,
+            max_retries=3,
+            temperature=0.2,
+            json_mode=True,
+            logger=self.log,
+            log_prefix="[VLM] ",
+        )
+        data = extract_json_from_text(raw)
         return {
             "reasoning": str(data.get("reasoning") or "").strip(),
             "is_relevant": as_bool(data.get("is_relevant"), default=False),
+            "tokens": _tokens or {},
         }
 
     def extract_fine_forgery_points(
         self,
+        forged_frame_paths: list[str],
         candidate_frame_paths: list[str],
         *,
         physical_observations: str = "",
-        temporal_analysis: str = "",
-        forbidden_overlay_text: str = "",
+        logical_analysis: str = "",
+        search_intent: str = "",
+        entities: dict[str, list[str]] | None = None,
     ) -> dict[str, Any]:
-        """Send candidate frames + COT text to VLM for forgery point extraction.
-
-        The COT text lets the model compare source frames against the forgery
-        description instead of blindly guessing manipulation types.
-        """
+        """Fine-grained narrative forgery extraction over forged vs candidate."""
+        entities_summary = json.dumps(entities or {}, ensure_ascii=False)
         prompt = PROMPT_FINE_FORGERY_POINTS.format(
             physical_observations=physical_observations or "(not available)",
-            temporal_analysis=temporal_analysis or "(not available)",
-            forbidden_overlay_text=forbidden_overlay_text or "(none found)",
+            logical_analysis=logical_analysis or "(not available)",
+            search_intent=search_intent or "(not available)",
+            entities_summary=entities_summary,
         )
-        data = self._vlm_json_from_frames(
-            candidate_frame_paths, prompt, temperature=0.2
+        contents = _build_multimodal_content(
+            prompt + "\n\nFrame groups order:\n- First all images are Group A (forged).\n- Then all images are Group B (candidate).",
+            image_paths=[*forged_frame_paths, *candidate_frame_paths],
         )
+        raw, _tokens = call_vlm_with_retry(
+            self.client,
+            self.model,
+            contents,
+            max_retries=3,
+            temperature=0.2,
+            json_mode=True,
+            logger=self.log,
+            log_prefix="[VLM] ",
+        )
+        data = extract_json_from_text(raw)
         raw_points = data.get("points") or []
         points = []
         if isinstance(raw_points, list):
@@ -1025,6 +1086,7 @@ class AgentTools:
         return {
             "source_description": str(data.get("source_description") or "").strip(),
             "points": points,
+            "tokens": _tokens or {},
         }
 
     def deepsearch_next_step(
@@ -1034,9 +1096,12 @@ class AgentTools:
         source_descriptions: list[str],
         prev_queries: list[str],
         *,
+        current_round: int | None = None,
+        max_rounds: int | None = None,
         physical_observations: str = "",
-        temporal_analysis: str = "",
-        forbidden_overlay_text: str = "",
+        logical_analysis: str = "",
+        search_intent: str = "",
+        entities: dict[str, list[str]] | None = None,
     ) -> dict[str, Any]:
         """Combined sufficiency judgment + next keyword generation.
 
@@ -1066,11 +1131,33 @@ class AgentTools:
 
         # Format previous queries
         q_str = "\n".join(f"  - {q}" for q in prev_queries) if prev_queries else "  (none)"
+        entities_summary = json.dumps(entities or {}, ensure_ascii=False)
+        if current_round is not None and max_rounds is not None:
+            if current_round == max_rounds - 1:
+                round_status = (
+                    f"Current round: {current_round}/{max_rounds}. "
+                    f"The NEXT round ({max_rounds}/{max_rounds}) will be the FINAL round. "
+                    "If evidence is still insufficient, you must output one concrete non-empty next_keyword for that final attempt."
+                )
+            elif current_round >= max_rounds:
+                round_status = (
+                    f"Current round: {current_round}/{max_rounds}. "
+                    "This is already the FINAL round."
+                )
+            else:
+                round_status = (
+                    f"Current round: {current_round}/{max_rounds}. "
+                    f"There are {max_rounds - current_round} round(s) remaining including the next one."
+                )
+        else:
+            round_status = "Round status unavailable."
 
         prompt = PROMPT_DEEPSEARCH_NEXT_STEP.format(
+            round_status=round_status,
             physical_observations=physical_observations or "(not available)",
-            temporal_analysis=temporal_analysis or "(not available)",
-            forbidden_overlay_text=forbidden_overlay_text or "(none)",
+            logical_analysis=logical_analysis or "(not available)",
+            search_intent=search_intent or "(not available)",
+            entities_summary=entities_summary,
             source_descriptions=src_str,
             collected_points=points_str,
             examined_videos=videos_str,
@@ -1093,4 +1180,5 @@ class AgentTools:
             "is_sufficient": as_bool(data.get("is_sufficient"), default=False),
             "missing_description": str(data.get("missing_description") or "").strip(),
             "next_keyword": str(data.get("next_keyword") or "").strip(),
+            "tokens": _tokens or {},
         }

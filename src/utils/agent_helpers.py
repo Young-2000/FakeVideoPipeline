@@ -232,6 +232,8 @@ def call_vlm_with_retry(
 
 import cv2
 
+from src.utils.frame_sampling import sample_frames_uniform
+
 
 def uniform_sample_frames(
     video_path: str,
@@ -240,43 +242,38 @@ def uniform_sample_frames(
     output_dir: str | Path,
     prefix: str = "frame",
     jpeg_quality: int = 85,
-) -> list[str]:
-    """Uniformly sample `num_frames` from `video_path` and save them to `output_dir`.
+    target_height: int | None = None,
+    cache_dir: str | Path | None = None,
+) -> tuple[list[str], bool]:
+    """Uniformly sample `num_frames` from `video_path` via ffmpeg (sequential decode).
 
-    Returns the sorted list of saved frame paths. Raises FileNotFoundError /
-    ValueError on unopenable / 0-frame videos.
+    If `target_height` is set, frames are scaled to that height (width even, proportional).
 
-    Used by Stage B (forgery analysis) where we want a fixed visual budget per
-    video regardless of shot count. For shot-aware sampling, see
-    `_sample_frames_by_shot` in `agent_pipeline.py`.
+    If `cache_dir` is set, cached ``{prefix}_{frame_idx}.jpg`` files are reused on hit.
+
+    Returns ``(frame_paths, cache_hit)``. Raises on missing ffmpeg or decode failure.
     """
-    cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
+    video = Path(video_path)
+    if not video.is_file():
         raise FileNotFoundError(f"Cannot open video: {video_path}")
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    if total <= 0:
-        cap.release()
-        raise ValueError(f"Invalid frame count for video: {video_path}")
 
-    n = max(1, min(int(num_frames), total))
-    if n == 1:
-        indices = [total // 2]
-    else:
-        indices = [round(i * (total - 1) / (n - 1)) for i in range(n)]
+    if cache_dir is not None:
+        cached = sorted(str(p) for p in Path(cache_dir).glob(f"{prefix}_*.jpg"))
+        if cached:
+            return cached, True
 
-    out_dir = Path(output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    saved: list[str] = []
-    for idx in indices:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-        ok, frame = cap.read()
-        if not ok:
-            continue
-        p = out_dir / f"{prefix}_{idx:08d}.jpg"
-        cv2.imwrite(str(p), frame, [int(cv2.IMWRITE_JPEG_QUALITY), int(jpeg_quality)])
-        saved.append(str(p))
-    cap.release()
-    return saved
+    out_dir = Path(cache_dir) if cache_dir is not None else Path(output_dir)
+    saved = sample_frames_uniform(
+        str(video),
+        num_frames,
+        out_dir,
+        prefix=prefix,
+        target_height=target_height,
+        jpeg_quality=jpeg_quality,
+    )
+    if not saved:
+        raise ValueError(f"No frames extracted from video: {video_path}")
+    return saved, False
 
 
 def score_shot_informativeness(frame_path: str) -> dict[str, float]:

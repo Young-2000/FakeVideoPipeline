@@ -1,13 +1,13 @@
-"""Folder-level orchestrator: Stage A (retrieval + deepsearch) -> Stage C (judge).
+"""Batch orchestrator: Stage A (retrieval + deepsearch) -> Stage C (judge).
 
 Usage::
 
-    python -m src.cli <folder>
+    python -m src.cli <folder-or-manifest>
 
 Common flags::
 
     [--manifest Edit.json]
-    [--output _results]
+    [--output _results_YYYYMMDD_HHMMSS]
     [--limit N]
     [--skip-judge]
     [--resume / --no-resume]
@@ -15,7 +15,8 @@ Common flags::
     ... plus retrieval hyperparams (--top-k, --max-deepsearch-rounds, ...)
 
 Outputs:
-    <folder>/<output>/per_video/<video_id>.json
+    <folder>/<output>/results.jsonl
+    <folder>/<output>/run_trace.jsonl   (only with --save-run-trace)
     <folder>/<output>/summary.json
     <folder>/<output>/summary.md
     <folder>/<output>/logs/run_<ts>_<vid>.log
@@ -28,6 +29,7 @@ import datetime
 import json
 import os
 import sys
+import threading
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -36,14 +38,20 @@ _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from src.agent.judge import judge_points  # noqa: E402
+from src.agent.judge import DEFAULT_JUDGE_MODELS, judge_points  # noqa: E402
 from src.agent.oracle_eval import (  # noqa: E402
     extract_groundtruth,
     load_manifest_entries,
 )
 from src.agent_pipeline_v2 import VisualRetrievalAgentV2  # noqa: E402
-from src.utils.config import OPENAI_MODEL, get_llm_client  # noqa: E402
+from src.utils.config import get_llm_client  # noqa: E402
 from src.utils.pipeline_log import default_log_path, tee_stdout  # noqa: E402
+from src.utils.token_usage import (  # noqa: E402
+    add_token_counter,
+    empty_token_counter,
+    merge_model_token_usage,
+    normalize_token_counter,
+)
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -51,9 +59,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         description="Run deepsearch retrieval + judge on a folder of forged videos.",
     )
     parser.add_argument(
-        "folder",
+        "input_path",
         type=str,
-        help="Path to a folder containing forged .mp4 files and a manifest JSON (default name: Edit.json).",
+        help="Path to a folder containing forged .mp4 files, or directly to a manifest JSON file. Video files are expected in the same directory as the manifest.",
     )
     parser.add_argument(
         "--manifest",
@@ -65,7 +73,19 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--output",
         type=str,
         default="_results",
-        help="Output subdirectory under <folder> for per-video results & summary (default: _results).",
+        help="Output subdirectory under <folder>. Default `_results` is expanded to `_results_<timestamp>` on each run.",
+    )
+    parser.add_argument(
+        "--results-jsonl",
+        type=str,
+        default=None,
+        help="Path for appended results JSONL. Absolute paths are used as-is; relative paths are resolved under --output. Default: <output>/results.jsonl.",
+    )
+    parser.add_argument(
+        "--trace-jsonl",
+        type=str,
+        default=None,
+        help="Path for appended run-trace JSONL. Absolute paths are used as-is; relative paths are resolved under --output. Default: <output>/run_trace.jsonl.",
     )
     parser.add_argument(
         "--limit",
@@ -101,7 +121,16 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--judge-model",
         type=str,
         default=None,
-        help="Override the LLM model for Stage C judging (default: $OPENAI_MODEL).",
+        help="Legacy single-judge override for Stage C. If set, only this judge model is used.",
+    )
+    parser.add_argument(
+        "--judge-models",
+        type=str,
+        default="",
+        help=(
+            "Comma-separated judge models for Stage C voting. "
+            f"Default: {', '.join(DEFAULT_JUDGE_MODELS)}"
+        ),
     )
     parser.add_argument(
         "--search-only",
@@ -113,13 +142,24 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     # Stage A hyperparameters
     parser.add_argument("--top-k", type=int, default=10)
-    parser.add_argument("--total-sample-frames", type=int, default=64)
+    parser.add_argument(
+        "--total-sample-frames",
+        type=int,
+        default=64,
+        help="Frames sampled from the input video (default: 64).",
+    )
     parser.add_argument("--query-temperature", type=float, default=0.4)
     parser.add_argument(
         "--download-dir",
         type=str,
         default="downloads",
         help="Where to save downloaded candidate videos (relative path resolved from CWD).",
+    )
+    parser.add_argument(
+        "--candidate-video-height",
+        type=int,
+        default=480,
+        help="Max height for searched/downloaded candidate videos in pixels (default: 480). Input videos are unchanged.",
     )
     parser.add_argument("--quiet", action="store_true")
     # Deepsearch-specific hyperparameters
@@ -132,14 +172,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--candidate-sample-frames",
         type=int,
-        default=64,
-        help="Frames sampled from each candidate video for fine extraction (default 64).",
+        default=None,
+        help="Frames sampled from each candidate video for fine extraction (default: same as --total-sample-frames).",
     )
     parser.add_argument(
         "--max-deepsearch-rounds",
         type=int,
-        default=5,
-        help="Max search rounds before giving up (default 5).",
+        default=6,
+        help="Max search rounds before giving up (default 6).",
     )
     parser.add_argument(
         "--coarse-sample-frames",
@@ -167,10 +207,26 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Number of videos to process in parallel (default 1 = sequential).",
     )
     parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=None,
+        help="Alias for --parallel-videos. If provided, overrides --parallel-videos.",
+    )
+    parser.add_argument(
         "--log-dir",
         type=str,
         default=None,
         help="Override log directory path (default: <output>/logs).",
+    )
+    parser.add_argument(
+        "--save-run-trace",
+        action="store_true",
+        help="Save a structured per-video run trace with COT summaries, queries, and candidate titles/URLs (default: off).",
+    )
+    parser.add_argument(
+        "--skip-summary",
+        action="store_true",
+        help="Do not write summary.json or summary.md. Useful when only JSONL outputs are needed.",
     )
     return parser
 
@@ -259,6 +315,34 @@ def _write_summary_md(summary: dict[str, Any], out_md: Path) -> None:
         lines.append(f"- Accuracy: **{s['accuracy']:.3f}**")
         lines.append(f"- Per-task accuracy: `{s['per_task_breakdown']}`")
     lines.append("")
+    t = summary.get("tokens") or {}
+    lines.append("## Token usage")
+    lines.append("")
+    lines.append(
+        f"- Total: **{int(t.get('total_tokens', 0))}** "
+        f"(prompt={int(t.get('total_prompt_tokens', 0))}, completion={int(t.get('total_completion_tokens', 0))})"
+    )
+    by_stage = t.get("by_stage") or {}
+    retrieval_stage = by_stage.get("retrieval") or {}
+    judge_stage = by_stage.get("judge") or {}
+    lines.append(
+        f"- Stage A retrieval: {int(retrieval_stage.get('total_tokens', 0))} "
+        f"(prompt={int(retrieval_stage.get('prompt_tokens', 0))}, completion={int(retrieval_stage.get('completion_tokens', 0))})"
+    )
+    lines.append(
+        f"- Stage C judge: {int(judge_stage.get('total_tokens', 0))} "
+        f"(prompt={int(judge_stage.get('prompt_tokens', 0))}, completion={int(judge_stage.get('completion_tokens', 0))})"
+    )
+    by_model = t.get("by_model") or {}
+    if by_model:
+        lines.append("- Per-model token totals:")
+        for model_name in sorted(by_model.keys()):
+            usage = by_model.get(model_name) or {}
+            lines.append(
+                f"  - `{model_name}`: {int(usage.get('total_tokens', 0))} "
+                f"(prompt={int(usage.get('prompt_tokens', 0))}, completion={int(usage.get('completion_tokens', 0))})"
+            )
+    lines.append("")
     lines.append("## Per-video table")
     lines.append("")
     lines.append("| Video ID | Task | Truth hit | Resolved groups | Score |")
@@ -282,12 +366,116 @@ def _build_partial_record(*, entry: dict[str, Any], video_id: str, error: str) -
         "task": str(entry.get("task") or ""),
         "retrieval": {"matched_urls": [], "retrieved_truth_ids": [], "truth_hit": False},
         "deepsearch": {"collected_forgery_points": [], "evidence_videos": []},
-        "tokens": {},
+        "tokens": {
+            **empty_token_counter(),
+            "by_model": {},
+            "stages": {
+                "retrieval": {**empty_token_counter(), "by_model": {}},
+                "judge": {**empty_token_counter(), "by_model": {}},
+            },
+        },
         "analysis": {"mode": "interrupted", "points": []},
         "score": None,
         "error": error,
         "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
     }
+
+
+def _merge_token_usage(
+    retrieval_tokens_raw: Any,
+    judge_tokens_raw: Any,
+) -> dict[str, Any]:
+    retrieval_tokens = normalize_token_counter(retrieval_tokens_raw)
+    judge_tokens = normalize_token_counter(judge_tokens_raw)
+
+    retrieval_by_model: dict[str, dict[str, int]] = {}
+    judge_by_model: dict[str, dict[str, int]] = {}
+    if isinstance(retrieval_tokens_raw, dict):
+        merge_model_token_usage(retrieval_by_model, retrieval_tokens_raw.get("by_model"))
+    if isinstance(judge_tokens_raw, dict):
+        merge_model_token_usage(judge_by_model, judge_tokens_raw.get("by_model"))
+
+    overall = empty_token_counter()
+    add_token_counter(overall, retrieval_tokens)
+    add_token_counter(overall, judge_tokens)
+
+    overall_by_model: dict[str, dict[str, int]] = {}
+    merge_model_token_usage(overall_by_model, retrieval_by_model)
+    merge_model_token_usage(overall_by_model, judge_by_model)
+
+    return {
+        **overall,
+        "by_model": overall_by_model,
+        "stages": {
+            "retrieval": {**retrieval_tokens, "by_model": retrieval_by_model},
+            "judge": {**judge_tokens, "by_model": judge_by_model},
+        },
+    }
+
+
+def _append_jsonl(path: Path, row: dict[str, Any], *, lock: threading.Lock) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(row, ensure_ascii=False) + "\n"
+    with lock:
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(line)
+
+
+def _load_jsonl_records(path: Path) -> list[dict[str, Any]]:
+    if not path.is_file():
+        return []
+    rows: list[dict[str, Any]] = []
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(obj, dict):
+            rows.append(obj)
+    return rows
+
+
+def _dedupe_records_by_video_id(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_id: dict[str, dict[str, Any]] = {}
+    ordered_ids: list[str] = []
+    for row in records:
+        video_id = str(row.get("video_id") or "").strip()
+        if not video_id:
+            continue
+        if video_id not in by_id:
+            ordered_ids.append(video_id)
+        by_id[video_id] = row
+    return [by_id[video_id] for video_id in ordered_ids]
+
+
+def _build_trace_row(*, record: dict[str, Any], run_trace: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "video_id": record.get("video_id"),
+        "topic": record.get("topic"),
+        "task": record.get("task"),
+        "timestamp": record.get("timestamp"),
+        "run_trace": run_trace,
+    }
+
+
+def _resolve_output_path(base_dir: Path, raw_path: str | None, default_name: str) -> Path:
+    if not raw_path:
+        return base_dir / default_name
+    p = Path(raw_path)
+    if p.is_absolute():
+        return p
+    return base_dir / p
+
+
+def _resolve_judge_models(args) -> list[str]:
+    if getattr(args, "judge_models", "").strip():
+        return [s.strip() for s in args.judge_models.split(",") if s.strip()]
+    if getattr(args, "judge_model", None):
+        return [str(args.judge_model).strip()]
+    return list(DEFAULT_JUDGE_MODELS)
 
 
 def _process_one(
@@ -297,11 +485,18 @@ def _process_one(
     output_dir: Path,
     downloads_dir: Path,
     agent: VisualRetrievalAgentV2,
-    judge_model: str,
+    judge_models: list[str],
     judge_client,
     skip_judge: bool,
+    save_run_trace: bool,
     resume: bool,
+    completed_ids: set[str],
+    completed_ids_lock: threading.Lock,
     log_dir: Path,
+    results_jsonl_path: Path,
+    results_jsonl_lock: threading.Lock,
+    trace_jsonl_path: Path | None,
+    trace_jsonl_lock: threading.Lock | None,
     parallel_mode: bool = False,
 ) -> dict[str, Any] | None:
     """Run A->C on one video. Returns the per-video result dict or None if skipped."""
@@ -313,14 +508,11 @@ def _process_one(
         print(f"[Orchestrator] skip {video_id}: video file not found ({video_path})", flush=True)
         return None
 
-    per_video_path = output_dir / "per_video" / f"{video_id}.json"
-    if resume and per_video_path.is_file():
-        try:
-            cached = json.loads(per_video_path.read_text(encoding="utf-8"))
-            print(f"[Orchestrator] reuse cached result for {video_id} ({per_video_path})", flush=True)
-            return cached
-        except Exception:
-            print(f"[Orchestrator] cached result unreadable for {video_id}; re-running", flush=True)
+    with completed_ids_lock:
+        already_done = video_id in completed_ids
+    if resume and already_done:
+        print(f"[Orchestrator] reuse cached jsonl result for {video_id}", flush=True)
+        return None
 
     log_path = default_log_path(log_dir, video_id)
     print(f"[Orchestrator] {video_id}: log -> {log_path}", flush=True)
@@ -336,9 +528,15 @@ def _process_one(
                 entry=entry, video_id=video_id, video_path=video_path,
                 dataset_folder=dataset_folder, output_dir=output_dir,
                 downloads_dir=downloads_dir, agent=agent,
-                judge_model=judge_model, judge_client=judge_client,
+                judge_models=judge_models, judge_client=judge_client,
                 skip_judge=skip_judge,
-                per_video_path=per_video_path,
+                save_run_trace=save_run_trace,
+                completed_ids=completed_ids,
+                completed_ids_lock=completed_ids_lock,
+                results_jsonl_path=results_jsonl_path,
+                results_jsonl_lock=results_jsonl_lock,
+                trace_jsonl_path=trace_jsonl_path,
+                trace_jsonl_lock=trace_jsonl_lock,
             )
         finally:
             if hasattr(agent, "set_log_file"):
@@ -349,9 +547,15 @@ def _process_one(
                 entry=entry, video_id=video_id, video_path=video_path,
                 dataset_folder=dataset_folder, output_dir=output_dir,
                 downloads_dir=downloads_dir, agent=agent,
-                judge_model=judge_model, judge_client=judge_client,
+                judge_models=judge_models, judge_client=judge_client,
                 skip_judge=skip_judge,
-                per_video_path=per_video_path,
+                save_run_trace=save_run_trace,
+                completed_ids=completed_ids,
+                completed_ids_lock=completed_ids_lock,
+                results_jsonl_path=results_jsonl_path,
+                results_jsonl_lock=results_jsonl_lock,
+                trace_jsonl_path=trace_jsonl_path,
+                trace_jsonl_lock=trace_jsonl_lock,
             )
 
 
@@ -364,10 +568,16 @@ def _process_one_inner(
     output_dir: Path,
     downloads_dir: Path,
     agent: VisualRetrievalAgentV2,
-    judge_model: str,
+    judge_models: list[str],
     judge_client,
     skip_judge: bool,
-    per_video_path: Path,
+    save_run_trace: bool,
+    completed_ids: set[str],
+    completed_ids_lock: threading.Lock,
+    results_jsonl_path: Path,
+    results_jsonl_lock: threading.Lock,
+    trace_jsonl_path: Path | None,
+    trace_jsonl_lock: threading.Lock | None,
 ) -> dict[str, Any]:
     """Core logic of _process_one, extracted so tee_stdout wrapping is clean."""
     print(f"=== Stage A: retrieval ({video_id}) ===", flush=True)
@@ -377,15 +587,17 @@ def _process_one_inner(
         # Save partial result so user can see progress
         print(f"[Orchestrator] {video_id}: interrupted during retrieval; saving partial result", flush=True)
         partial = _build_partial_record(entry=entry, video_id=video_id, error="interrupted_during_retrieval")
-        per_video_path.parent.mkdir(parents=True, exist_ok=True)
-        per_video_path.write_text(json.dumps(partial, ensure_ascii=False, indent=2), encoding="utf-8")
+        _append_jsonl(results_jsonl_path, partial, lock=results_jsonl_lock)
+        with completed_ids_lock:
+            completed_ids.add(video_id)
         return partial
     except Exception as exc:
         # Save partial result on any error so we can debug
         print(f"[Orchestrator] {video_id}: retrieval failed: {exc}", flush=True)
         partial = _build_partial_record(entry=entry, video_id=video_id, error=f"retrieval_failed: {exc}")
-        per_video_path.parent.mkdir(parents=True, exist_ok=True)
-        per_video_path.write_text(json.dumps(partial, ensure_ascii=False, indent=2), encoding="utf-8")
+        _append_jsonl(results_jsonl_path, partial, lock=results_jsonl_lock)
+        with completed_ids_lock:
+            completed_ids.add(video_id)
         return partial
 
     retrieved_truth_ids = retrieval.get("retrieved_truth_ids") or []
@@ -413,7 +625,7 @@ def _process_one_inner(
 
     gt_points = extract_groundtruth(entry)
     score_result: dict[str, Any] | None = None
-    if not skip_judge and gt_points:
+    if not skip_judge and gt_points and collected_points:
         print(f"=== Stage C: judging ({video_id}) ===", flush=True)
         try:
             score_result = judge_points(
@@ -421,30 +633,70 @@ def _process_one_inner(
                 gt_points=gt_points,
                 pred_points=analysis.get("points") or [],
                 client=judge_client,
-                model=judge_model,
+                models=judge_models,
                 logger=lambda m: print(m, flush=True),
             )
         except Exception as exc:
             print(f"[Orchestrator] {video_id}: Stage C failed: {exc}", flush=True)
             score_result = {
                 "video_id": video_id,
+                "judge_models": judge_models,
+                "n_gt": len(gt_points),
+                "passed_gt_count": 0,
                 "hits": 0,
                 "score": 0.0,
-                "matches": [],
+                "gt_vote_results": [],
+                "judge_results": [],
                 "comment": "",
                 "ok": False,
                 "error": f"judge_failed: {exc}",
+                "token_usage": {
+                    **empty_token_counter(),
+                    "by_model": {m: empty_token_counter() for m in judge_models},
+                },
             }
+    elif not skip_judge and gt_points and not collected_points:
+        print(f"[Orchestrator] {video_id}: no predicted forgery points; skipping Stage C judge", flush=True)
+        score_result = {
+            "video_id": video_id,
+            "judge_models": judge_models,
+            "n_gt": len(gt_points),
+            "passed_gt_count": 0,
+            "hits": 0,
+            "score": 0.0,
+            "gt_vote_results": [],
+            "judge_results": [],
+            "comment": "",
+            "ok": False,
+            "error": None,
+            "skipped_reason": "no_pred_points",
+            "token_usage": {
+                **empty_token_counter(),
+                "by_model": {m: empty_token_counter() for m in judge_models},
+            },
+        }
     elif skip_judge:
         print(f"[Orchestrator] {video_id}: --skip-judge in effect; skipping Stage C", flush=True)
     else:
         print(f"[Orchestrator] {video_id}: no groundtruth in manifest; Stage C skipped", flush=True)
 
     expected_ids = retrieval.get("oracle_eval", {}).get("expected_source_ids", []) or []
+    merged_tokens = _merge_token_usage(
+        retrieval.get("tokens") or {},
+        (score_result or {}).get("token_usage") or {},
+    )
+    judge_overview = {
+        "judge_models": (score_result or {}).get("judge_models", judge_models),
+        "n_gt": int((score_result or {}).get("n_gt", len(gt_points)) or 0),
+        "passed_gt_count": int((score_result or {}).get("passed_gt_count", 0) or 0),
+        "score": float((score_result or {}).get("score", 0.0) or 0.0) if score_result else None,
+        "skipped_reason": (score_result or {}).get("skipped_reason"),
+    }
     record = {
         "video_id": video_id,
-        "topic": str(entry.get("topic") or ""),
         "task": str(entry.get("task") or ""),
+        "topic": str(entry.get("topic") or ""),
+        "judge_overview": judge_overview,
         "manifest_entry_snapshot": {
             "id": entry.get("id"),
             "topic": entry.get("topic"),
@@ -469,16 +721,22 @@ def _process_one_inner(
             "collected_forgery_points": retrieval.get("collected_forgery_points", []),
             "evidence_videos": retrieval.get("evidence_videos", []),
         },
-        "tokens": retrieval.get("tokens", {}),
+        "tokens": merged_tokens,
         "analysis": analysis,
         "ground_truth": gt_points,
         "score": score_result,
         "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
     }
-
-    per_video_path.parent.mkdir(parents=True, exist_ok=True)
-    per_video_path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"[Orchestrator] {video_id}: wrote {per_video_path}", flush=True)
+    _append_jsonl(results_jsonl_path, record, lock=results_jsonl_lock)
+    if save_run_trace and trace_jsonl_path and trace_jsonl_lock:
+        _append_jsonl(
+            trace_jsonl_path,
+            _build_trace_row(record=record, run_trace=retrieval.get("run_trace", {})),
+            lock=trace_jsonl_lock,
+        )
+    with completed_ids_lock:
+        completed_ids.add(video_id)
+    print(f"[Orchestrator] {video_id}: appended to {results_jsonl_path}", flush=True)
     return record
 
 
@@ -506,7 +764,7 @@ def _build_summary(
             sc = float(score_obj.get("score", 0.0))
             per_task_score[task].append(sc)
             hits = int(score_obj.get("hits", 0))
-            n_gt = int(score_obj.get("n_gt", 3) or 3)
+            n_gt = int(score_obj.get("n_gt", 0) or 0)
             hit_points += hits
             total_points += n_gt
         per_video_rows.append(
@@ -525,14 +783,17 @@ def _build_summary(
     accuracy = hit_points / total_points if total_points else 0.0
 
     # Token aggregation
-    total_prompt_tokens = 0
-    total_completion_tokens = 0
-    total_all_tokens = 0
+    total_tokens = empty_token_counter()
+    retrieval_stage_tokens = empty_token_counter()
+    judge_stage_tokens = empty_token_counter()
+    tokens_by_model: dict[str, dict[str, int]] = {}
     for r in records:
         t = r.get("tokens") or {}
-        total_prompt_tokens += int(t.get("prompt_tokens", 0))
-        total_completion_tokens += int(t.get("completion_tokens", 0))
-        total_all_tokens += int(t.get("total_tokens", 0))
+        add_token_counter(total_tokens, t)
+        merge_model_token_usage(tokens_by_model, t.get("by_model"))
+        stages = t.get("stages") or {}
+        add_token_counter(retrieval_stage_tokens, stages.get("retrieval"))
+        add_token_counter(judge_stage_tokens, stages.get("judge"))
 
     return {
         "folder": str(folder),
@@ -557,10 +818,15 @@ def _build_summary(
             },
         },
         "tokens": {
-            "total_prompt_tokens": total_prompt_tokens,
-            "total_completion_tokens": total_completion_tokens,
-            "total_tokens": total_all_tokens,
-            "per_video_avg_tokens": round(total_all_tokens / n_videos) if n_videos else 0,
+            "total_prompt_tokens": total_tokens["prompt_tokens"],
+            "total_completion_tokens": total_tokens["completion_tokens"],
+            "total_tokens": total_tokens["total_tokens"],
+            "per_video_avg_tokens": round(total_tokens["total_tokens"] / n_videos) if n_videos else 0,
+            "by_model": tokens_by_model,
+            "by_stage": {
+                "retrieval": retrieval_stage_tokens,
+                "judge": judge_stage_tokens,
+            },
         },
         "per_video": per_video_rows,
     }
@@ -570,32 +836,60 @@ def main() -> None:
     parser = _build_arg_parser()
     args = parser.parse_args()
 
-    folder = Path(args.folder).resolve()
-    if not folder.is_dir():
-        raise SystemExit(f"Folder not found: {folder}")
-    manifest_path = folder / args.manifest
+    input_path = Path(args.input_path).resolve()
+    if input_path.is_file():
+        folder = input_path.parent
+        manifest_path = input_path
+    else:
+        folder = input_path
+        if not folder.is_dir():
+            raise SystemExit(f"Input path not found: {input_path}")
+        manifest_path = folder / args.manifest
     if not manifest_path.is_file():
         raise SystemExit(f"Manifest not found: {manifest_path}")
 
-    output_dir = folder / args.output
+    output_name = args.output
+    if output_name == "_results":
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_name = f"_results_{ts}"
+    output_dir = folder / output_name
     output_dir.mkdir(parents=True, exist_ok=True)
-    (output_dir / "per_video").mkdir(parents=True, exist_ok=True)
     if args.log_dir:
         log_dir = Path(args.log_dir).resolve()
     else:
         log_subdir = "logs"
         log_dir = output_dir / log_subdir
     log_dir.mkdir(parents=True, exist_ok=True)
+    results_jsonl_path = _resolve_output_path(output_dir, args.results_jsonl, "results.jsonl")
+    trace_jsonl_path = _resolve_output_path(output_dir, args.trace_jsonl, "run_trace.jsonl")
+    results_jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+    if args.save_run_trace:
+        trace_jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+    results_jsonl_lock = threading.Lock()
+    trace_jsonl_lock = threading.Lock()
 
     downloads_dir = Path(args.download_dir).resolve()
     downloads_dir.mkdir(parents=True, exist_ok=True)
 
+    existing_records = _dedupe_records_by_video_id(_load_jsonl_records(results_jsonl_path))
+    completed_ids = {
+        str(r.get("video_id") or "").strip()
+        for r in existing_records
+        if str(r.get("video_id") or "").strip()
+    }
+    completed_ids_lock = threading.Lock()
+
     entries_all = load_manifest_entries(manifest_path)
     only_ids = [s.strip() for s in (args.only_ids or "").split(",") if s.strip()]
     entries = _filter_entries(entries_all, only_ids=only_ids or None, limit=args.limit)
+    requested_workers = args.num_workers if args.num_workers is not None else args.parallel_videos
+    n_workers = max(1, int(requested_workers))
     print(
         f"[Orchestrator] folder={folder} manifest={manifest_path.name} "
-        f"entries={len(entries)}/{len(entries_all)} output={output_dir} log_dir={log_dir}",
+        f"entries={len(entries)}/{len(entries_all)} output={output_dir} log_dir={log_dir} "
+        f"results_jsonl={results_jsonl_path} "
+        f"{'trace_jsonl=' + str(trace_jsonl_path) if args.save_run_trace else 'trace_jsonl=OFF'} "
+        f"resume_hits={len(completed_ids) if args.resume else 0}",
         flush=True,
     )
 
@@ -603,6 +897,7 @@ def main() -> None:
         top_k=args.top_k,
         total_sample_frames=args.total_sample_frames,
         candidate_sample_frames=args.candidate_sample_frames,
+        candidate_video_height=args.candidate_video_height,
         max_reflect_rounds=args.max_reflect_rounds,
         download_output_dir=str(downloads_dir),
         oracle_manifest_path=str(manifest_path),
@@ -613,12 +908,14 @@ def main() -> None:
         max_deepsearch_rounds=args.max_deepsearch_rounds,
         coarse_sample_frames=args.coarse_sample_frames,
         use_cot=args.use_cot,
+        save_run_trace=args.save_run_trace,
     )
     print(
         f"[Orchestrator] deepsearch hyperparameters: "
         f"total_sample_frames={args.total_sample_frames}, "
         f"top_k={args.top_k}, "
-        f"candidate_sample_frames={args.candidate_sample_frames}, "
+        f"candidate_sample_frames={agent.candidate_sample_frames}, "
+        f"candidate_video_height={args.candidate_video_height}, "
         f"coarse_sample_frames={args.coarse_sample_frames}, "
         f"max_deepsearch_rounds={args.max_deepsearch_rounds}, "
         f"max_reflect_rounds={args.max_reflect_rounds}, "
@@ -627,10 +924,11 @@ def main() -> None:
         flush=True,
     )
 
-    judge_model = args.judge_model or OPENAI_MODEL
+    judge_models = _resolve_judge_models(args)
+    print(f"[Orchestrator] judge models: {judge_models}", flush=True)
     client = get_llm_client()
 
-    records: list[dict[str, Any]] = []
+    records: list[dict[str, Any]] = list(existing_records) if args.resume else []
 
     def _process_one_wrapper(entry):
         """Wrapper that catches exceptions per-video for thread safety."""
@@ -641,11 +939,18 @@ def main() -> None:
                 output_dir=output_dir,
                 downloads_dir=downloads_dir,
                 agent=agent,
-                judge_model=judge_model,
+                judge_models=judge_models,
                 judge_client=client,
                 skip_judge=args.skip_judge,
+                save_run_trace=args.save_run_trace,
                 resume=args.resume,
+                completed_ids=completed_ids,
+                completed_ids_lock=completed_ids_lock,
                 log_dir=log_dir,
+                results_jsonl_path=results_jsonl_path,
+                results_jsonl_lock=results_jsonl_lock,
+                trace_jsonl_path=(trace_jsonl_path if args.save_run_trace else None),
+                trace_jsonl_lock=(trace_jsonl_lock if args.save_run_trace else None),
                 parallel_mode=(n_workers > 1),
             )
         except KeyboardInterrupt:
@@ -657,7 +962,6 @@ def main() -> None:
             print(f"[Orchestrator] entry {vid!r}: fatal: {exc}", flush=True)
             return None
 
-    n_workers = max(1, args.parallel_videos)
     if n_workers <= 1:
         # Sequential processing (original behavior)
         for entry in entries:
@@ -690,12 +994,15 @@ def main() -> None:
                 executor.shutdown(wait=False, cancel_futures=True)
 
     # Save summary even if some videos were interrupted
-    summary = _build_summary(folder=folder, manifest=manifest_path.name, records=records)
-    summary_path = output_dir / "summary.json"
-    summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-    _write_summary_md(summary, output_dir / "summary.md")
-    print(f"[Orchestrator] wrote {summary_path}", flush=True)
-    print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
+    if args.skip_summary:
+        print("[Orchestrator] --skip-summary in effect; summary.json and summary.md not written", flush=True)
+    else:
+        summary = _build_summary(folder=folder, manifest=manifest_path.name, records=_dedupe_records_by_video_id(records))
+        summary_path = output_dir / "summary.json"
+        summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+        _write_summary_md(summary, output_dir / "summary.md")
+        print(f"[Orchestrator] wrote {summary_path}", flush=True)
+        print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
 
 
 if __name__ == "__main__":

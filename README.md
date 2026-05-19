@@ -14,7 +14,7 @@
 
 1. **COT 分析**（1 次 VLM 调用）：对均匀采样的帧做链式推理，提取场地文字、球衣号码、转播角标等物质线索，以及时间连续性、比分条等可疑点；同时生成检索关键词。
 2. **DeepSearch 循环**（至多 N 轮）：
-   - **搜索**：用 COT 得到的关键词通过 **yt-dlp**（`ytsearch`）检索 YouTube。
+   - **搜索**：用 COT 得到的关键词通过 **Serper API**（`google.serper.dev`）检索 YouTube。
    - **下载**：用 yt-dlp 下载候选视频。
    - **粗相关性**（默认 16 帧）：低成本 VLM 判断是否为同一事件 / 同源素材。
    - **细提取**（默认 64 帧）：对伪造视频与候选做详细对比，输出若干条结构化伪造点描述。
@@ -38,7 +38,8 @@
 ## 环境要求
 
 - Python 3.11+
-- **Node.js / Deno / Bun（至少其一）**：YouTube 解签与挑战需要 JS 运行时；未安装时搜索/下载容易 403。
+- **Serper API Key**（https://serper.dev 注册获取）：用于 YouTube 视频检索。
+- **Node.js / Deno / Bun（至少其一）**：YouTube 下载解签与挑战需要 JS 运行时；未安装时下载容易 403。
 - （可选）浏览器导出的 **YouTube Cookie**，用于年龄限制或人机验证场景。
 - 与 OpenAI Python SDK **兼容** 的 API：`OPENAI_API_KEY`（以及可选的 `OPENAI_BASE_URL`）。仓库默认示例使用 **OpenRouter**，你可改为官方 OpenAI 或其它网关。
 
@@ -51,7 +52,7 @@ cd FakeVideoPipeline   # 或你自定义的克隆目录名
 pip install -r requirements.txt
 
 cp .env.example .env
-# 编辑 .env，至少设置 OPENAI_API_KEY；按需修改 OPENAI_BASE_URL / OPENAI_MODEL
+# 编辑 .env，至少设置 OPENAI_API_KEY 和 SERPAPI_KEY；按需修改 OPENAI_BASE_URL / OPENAI_MODEL
 ```
 
 `pip install yt-dlp[default]` 后，请确认命令行中能执行 `yt-dlp --version`。
@@ -144,7 +145,7 @@ python -m src.cli /path/to/videos --search-only
 │   ├── cli.py                 # 批处理编排（阶段 A → C）
 │   ├── agent_pipeline_v2.py   # VisualRetrievalAgentV2（DeepSearch 主逻辑）
 │   ├── agent/
-│   │   ├── tools.py           # VLM、yt-dlp 搜索/下载、抽帧
+│   │   ├── tools.py           # VLM、Serper 搜索、yt-dlp 下载、抽帧
 │   │   ├── prompts.py
 │   │   ├── judge.py           # Judge
 │   │   ├── session_state.py

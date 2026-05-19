@@ -1,4 +1,4 @@
-"""Oracle-eval helpers: load truth IDs / GT 3-point lists from Edit-style manifests.
+"""Oracle-eval helpers: load truth IDs / GT 3-5 point lists from Edit-style manifests.
 
 Manifest entry schema (Edit.json / example.json):
     {
@@ -8,7 +8,7 @@ Manifest entry schema (Edit.json / example.json):
       "video2":    "<source youtube id>" | "",   # task 3.x has at least one
       "video3":    "<source youtube id>" | "",   # task 3.x sometimes has two
       "videoN":    ...                            # forward-compat: any videoN
-      "groundtruth": ["3-point GT text", ...]    # optional, may be missing
+      "groundtruth": ["GT point text", ...]      # optional, may be missing
     }
 """
 

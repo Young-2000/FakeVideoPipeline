@@ -81,7 +81,7 @@ class VisualRetrievalAgentV2:
         from src.utils.config import get_llm_client
 
         self.client = get_llm_client()
-        self.reasoning_model = reasoning_model or "google/gemini-2.5-pro"
+        self.reasoning_model = reasoning_model
         self.model = self.reasoning_model
         if frame_resize_workers is None:
             from src.utils.frame_sampling import default_frame_resize_workers

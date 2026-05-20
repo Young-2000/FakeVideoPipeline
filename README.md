@@ -52,7 +52,7 @@ cd FakeVideoPipeline   # 或你自定义的克隆目录名
 pip install -r requirements.txt
 
 cp .env.example .env
-# 编辑 .env，至少设置 OPENAI_API_KEY 和 SERPAPI_KEY；按需修改 OPENAI_BASE_URL / OPENAI_MODEL
+# 编辑 .env，至少设置 OPENAI_API_KEY 和 SERPAPI_KEY；按需修改 OPENAI_BASE_URL
 ```
 
 `pip install yt-dlp[default]` 后，请确认命令行中能执行 `yt-dlp --version`。
@@ -109,12 +109,12 @@ python -m src.cli /path/to/video/folder
 | `--total-sample-frames N` | 64 | COT / 细筛 / sufficiency 的输入视频采样帧数（缓存 `{id}_h480_n64`） |
 | `--candidate-sample-frames N` | 64 | 细对齐 / 抽取时的候选视频采样帧数 |
 | `--coarse-sample-frames N` | 16 | 粗筛：输入与候选各 16 帧（输入缓存 `{id}_h480_n16`） |
-| `--reasoning-model` | `$REASONING_MODEL` 或 `$OPENAI_MODEL` | COT / Reflect 专用模型；粗筛 / 细筛仍用 `$OPENAI_MODEL` |
+| `--reasoning-model` | `google/gemini-2.5-pro` | 所有 VLM 调用使用的模型 |
 | `--frame-resize-workers N` | 16 | 单次 ffmpeg 扫片抽帧后，并行缩放 JPEG 到目标高度的线程数（非多路解码） |
 | `--query-temperature` | 0.0 | 若干 VLM 调用的采样温度 |
 | `--download-dir` | `downloads`（相对当前工作目录解析） | 候选视频下载目录 |
 | `--use-cot` / `--no-cot` | 开 | 关闭 COT 时用文件名兜底关键词 |
-| `--judge-model` | `$OPENAI_MODEL` | Judge 阶段模型 |
+| `--judge-model` | `google/gemini-2.5-pro` | Judge 阶段模型 |
 | `--search-only` | 关 | 仅评估检索 oracle：不下载 / 不做视觉验证 |
 | `--quiet` | 关 | 减少 Agent 控制台输出 |
 | `--log-dir` | `<output>/logs` | 自定义日志目录 |

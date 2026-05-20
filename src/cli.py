@@ -190,11 +190,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--reasoning-model",
         type=str,
-        default=None,
-        help=(
-            "Model for COT / Reflect reasoning (default: REASONING_MODEL env or OPENAI_MODEL). "
-            "Coarse/fine/sufficiency VLM calls use OPENAI_MODEL."
-        ),
+        default="google/gemini-2.5-pro",
+        help="Model for all VLM calls (default: google/gemini-2.5-pro).",
     )
     parser.add_argument(
         "--frame-resize-workers",

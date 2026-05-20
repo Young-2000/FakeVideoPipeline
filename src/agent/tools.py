@@ -1185,11 +1185,9 @@ class AgentTools:
 
         # Text-only call — no images, saves ~70k tokens per round
         from src.utils.agent_helpers import call_vlm_with_retry
-        from src.utils.config import OPENAI_MODEL, get_llm_client
 
-        client = get_llm_client()
         raw, _tokens = call_vlm_with_retry(
-            client, OPENAI_MODEL,
+            self.client, self.model,
             [{"type": "text", "text": prompt}],
             temperature=0.0, logger=self.log,
         )

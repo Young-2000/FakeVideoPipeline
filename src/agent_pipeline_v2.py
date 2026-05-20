@@ -78,10 +78,10 @@ class VisualRetrievalAgentV2:
         reasoning_model: str | None = None,
         frame_resize_workers: int | None = None,
     ) -> None:
-        from src.utils.config import REASONING_MODEL, OPENAI_MODEL, get_llm_client
+        from src.utils.config import get_llm_client
 
         self.client = get_llm_client()
-        self.reasoning_model = reasoning_model or REASONING_MODEL or OPENAI_MODEL
+        self.reasoning_model = reasoning_model or "google/gemini-2.5-pro"
         self.model = self.reasoning_model
         if frame_resize_workers is None:
             from src.utils.frame_sampling import default_frame_resize_workers

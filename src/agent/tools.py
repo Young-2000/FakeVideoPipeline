@@ -788,6 +788,7 @@ class AgentTools:
                     num_frames=num_frames,
                     start_sec=start_sec,
                     end_sec=end_sec,
+                    source="candidate",
                 )
                 if cache_dir.is_dir():
                     cached = sorted(str(p) for p in cache_dir.glob("frame_*.jpg"))

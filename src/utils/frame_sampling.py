@@ -274,16 +274,21 @@ def resolve_frame_cache_dir(
     num_frames: int,
     start_sec: float | None = None,
     end_sec: float | None = None,
+    source: str = "",
 ) -> Path:
     """Persistent frame cache directory (input and candidate videos use the same layout).
 
-    Example: ``.frame_cache/NX7QNWEGcNI_h480_n64/`` or ``.frame_cache/ySqunOZDDMo_h480_n16/``.
+    Example: ``.frame_cache/input_NX7QNWEGcNI_h480_n64/`` or ``.frame_cache/cand_ySqunOZDDMo_h480_n16/``.
+
+    ``source`` creates a subdirectory (e.g. ``input/``, ``candidate/``) to avoid
+    collisions when a forged video and its YouTube source share the same ID.
     """
+    root = Path(cache_root) / source if source else Path(cache_root)
     name = f"{video_id}_h{int(height)}"
     if start_sec is not None and end_sec is not None and end_sec > start_sec:
         name += f"_s{int(start_sec)}_{int(end_sec)}"
     name += f"_n{int(num_frames)}"
-    return Path(cache_root) / name
+    return root / name
 
 
 def sample_frames_uniform(

@@ -915,6 +915,7 @@ class VisualRetrievalAgentV2:
                     input_video_id,
                     height=self.candidate_video_height,
                     num_frames=self.total_sample_frames,
+                    source="input",
                 )
             )
             self._log(f"[Sampling] persistent frame_cache: {cache_root}")
@@ -934,6 +935,7 @@ class VisualRetrievalAgentV2:
                     input_video_id,
                     height=self.candidate_video_height,
                     num_frames=self.coarse_sample_frames,
+                    source="input",
                 )
             )
             input_coarse_frame_paths, coarse_cache_hit = uniform_sample_frames(

@@ -276,9 +276,9 @@ def resolve_frame_cache_dir(
     end_sec: float | None = None,
     source: str = "",
 ) -> Path:
-    """Persistent frame cache directory (input and candidate videos use the same layout).
+    """Persistent frame cache directory.
 
-    Example: ``.frame_cache/input_NX7QNWEGcNI_h480_n64/`` or ``.frame_cache/cand_ySqunOZDDMo_h480_n16/``.
+    Example: ``.frame_cache/input/NX7QNWEGcNI_h480_n64/`` or ``.frame_cache/candidate/ySqunOZDDMo_h480_n16/``.
 
     ``source`` creates a subdirectory (e.g. ``input/``, ``candidate/``) to avoid
     collisions when a forged video and its YouTube source share the same ID.

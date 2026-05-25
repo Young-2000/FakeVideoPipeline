@@ -902,7 +902,7 @@ class VisualRetrievalAgentV2:
             # Step 1: Uniform frame sampling (compressed to candidate_video_height)
             input_video_id = Path(video_path).stem
             sampled_root = str(Path(temp_root) / "sampled_frames")
-            # Persistent cache: input and candidates share .frame_cache/{id}_h{H}_n{N}/
+            # Persistent cache: .frame_cache/input/{id}_h{H}_n{N}/ and .frame_cache/candidate/{id}_h{H}_n{N}/
             from src.utils.frame_sampling import resolve_frame_cache_dir
 
             _project_root = Path(__file__).resolve().parent.parent

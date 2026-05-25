@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,7 @@ from src.agent.prompts import (
     PROMPT_DEEPSEARCH_NEXT_STEP,
     PROMPT_FINE_FORGERY_POINTS,
 )
+from src.utils.config import resolve_yt_dlp_cookies_files
 
 # yt-dlp leaves intermediate fragment files named like "<id>.f251.webm" (audio-only)
 # or "<id>.f137.mp4" (video-only) when a merge step fails.
@@ -52,6 +54,37 @@ _DEFAULT_PLAYER_CLIENTS = "web,android"
 # first (default), then node/bun.
 _JS_RUNTIME_CANDIDATES = ("deno", "node", "bun")
 _DOWNLOAD_TIMEOUT_SECONDS = 240
+_COOKIE_RETRY_REASONS = frozenset(
+    {"http_403_bot_check", "http_429_rate_limited", "age_restricted"}
+)
+_COOKIE_STOP_REASONS = frozenset(
+    {"unavailable", "private_video", "geo_block", "http_404", "invalid_candidate_url"}
+)
+_cookies_rr_lock = threading.Lock()
+_cookies_rr_index = 0
+
+
+def _next_cookies_file(cookies_files: list[str]) -> str | None:
+    """Round-robin pick the next cookies file (thread-safe across workers)."""
+    global _cookies_rr_index
+    if not cookies_files:
+        return None
+    with _cookies_rr_lock:
+        idx = _cookies_rr_index % len(cookies_files)
+        _cookies_rr_index += 1
+    return cookies_files[idx]
+
+
+def _cookies_attempt_order(cookies_files: list[str]) -> list[str]:
+    """Primary cookie first (round-robin), then the rest for fallback retries."""
+    if not cookies_files:
+        return []
+    primary = _next_cookies_file(cookies_files)
+    if primary is None:
+        return []
+    order = [primary]
+    order.extend(path for path in cookies_files if path != primary)
+    return order
 
 
 def _detect_js_runtime() -> tuple[str, str] | None:
@@ -200,7 +233,14 @@ class AgentTools:
         self.coarse_frames = coarse_frames
         self.dense_frames = dense_frames
         self.query_temperature = query_temperature
-        self._cookies_file = self._resolve_cookies_file()
+        self._cookies_files = resolve_yt_dlp_cookies_files()
+        if self._cookies_files:
+            names = ", ".join(Path(path).name for path in self._cookies_files)
+            self.log(
+                f"[yt-dlp] cookies rotation enabled ({len(self._cookies_files)} files): {names}"
+            )
+        elif os.getenv("YT_DLP_COOKIES_FILE", "").strip() or os.getenv("YT_DLP_COOKIES_FILES", "").strip() or os.getenv("YT_DLP_COOKIES_DIR", "").strip():
+            self.log("[yt-dlp] cookies configured but no valid cookie files found")
         self._cookies_browser = (os.getenv("YT_DLP_COOKIES_FROM_BROWSER") or "").strip() or None
         if self._cookies_browser:
             self.log(
@@ -218,16 +258,12 @@ class AgentTools:
                 "Install one e.g. `brew install deno` or `brew install node`."
             )
 
-    def _resolve_cookies_file(self) -> str | None:
-        path = os.getenv("YT_DLP_COOKIES_FILE", "").strip()
-        if not path:
-            return None
-        if not Path(path).is_file():
-            self.log(f"[yt-dlp] YT_DLP_COOKIES_FILE configured but file missing: {path}")
-            return None
-        return path
-
-    def _ytdlp_common_args(self, *, use_browser_cookies: bool = False) -> list[str]:
+    def _ytdlp_common_args(
+        self,
+        *,
+        use_browser_cookies: bool = False,
+        cookies_file: str | None = None,
+    ) -> list[str]:
         """Common yt-dlp anti-bot flags for download."""
         args = [
             "--user-agent",
@@ -244,8 +280,8 @@ class AgentTools:
             args.extend(["--js-runtimes", f"{name}:{path}"])
         if use_browser_cookies and self._cookies_browser:
             args.extend(["--cookies-from-browser", self._cookies_browser])
-        elif self._cookies_file:
-            args.extend(["--cookies", self._cookies_file])
+        elif cookies_file:
+            args.extend(["--cookies", cookies_file])
         return args
 
     def _vlm_json_from_frames(
@@ -641,7 +677,11 @@ class AgentTools:
             ),
         ]
 
-        def _build_cmd(use_browser_cookies: bool, format_selector: str) -> list[str]:
+        def _build_cmd(
+            use_browser_cookies: bool,
+            format_selector: str,
+            cookies_file: str | None = None,
+        ) -> list[str]:
             cmd = [
                 "yt-dlp",
                 "--no-playlist",
@@ -654,7 +694,12 @@ class AgentTools:
                 "-o",
                 out_template,
             ]
-            cmd.extend(self._ytdlp_common_args(use_browser_cookies=use_browser_cookies))
+            cmd.extend(
+                self._ytdlp_common_args(
+                    use_browser_cookies=use_browser_cookies,
+                    cookies_file=cookies_file,
+                )
+            )
             cmd.append(candidate.url)
             return cmd
 
@@ -663,49 +708,21 @@ class AgentTools:
         stderr_tail = ""
         reason_code = "unknown"
         success = False
+        cookie_attempt_order = _cookies_attempt_order(self._cookies_files)
+        if not cookie_attempt_order:
+            cookie_attempt_order = [None]
 
-        for selector_name, format_selector in format_selectors:
-            try:
-                subprocess.run(
-                    _build_cmd(use_browser_cookies=False, format_selector=format_selector),
-                    capture_output=True,
-                    text=True,
-                    check=True,
-                    timeout=_DOWNLOAD_TIMEOUT_SECONDS,
-                )
-                success = True
-                break
-            except subprocess.CalledProcessError as exc:
-                err = exc
-                stderr_tail = (exc.stderr or "").strip()[-500:]
-                reason_code = _classify_ytdlp_failure(stderr_tail)
-                attempts.append(
-                    {
-                        "strategy": f"cookies_file:{selector_name}",
-                        "reason_code": reason_code,
-                    }
-                )
-            except subprocess.TimeoutExpired:
-                attempts.append(
-                    {
-                        "strategy": f"cookies_file:{selector_name}",
-                        "reason_code": "timeout",
-                    }
-                )
-                reason_code = "timeout"
-                continue
-
-            if (
-                self._cookies_browser
-                and reason_code in {"http_403_bot_check", "age_restricted", "private_video"}
-            ):
-                self.log(
-                    f"[yt-dlp] retrying download with --cookies-from-browser={self._cookies_browser} "
-                    f"after reason_code={reason_code} selector={selector_name}"
-                )
+        stop_all = False
+        for cookies_file in cookie_attempt_order:
+            cookie_label = Path(cookies_file).name if cookies_file else "none"
+            for selector_name, format_selector in format_selectors:
                 try:
                     subprocess.run(
-                        _build_cmd(use_browser_cookies=True, format_selector=format_selector),
+                        _build_cmd(
+                            use_browser_cookies=False,
+                            format_selector=format_selector,
+                            cookies_file=cookies_file,
+                        ),
                         capture_output=True,
                         text=True,
                         check=True,
@@ -713,24 +730,73 @@ class AgentTools:
                     )
                     success = True
                     break
-                except subprocess.CalledProcessError as exc2:
-                    err = exc2
-                    stderr_tail = (exc2.stderr or "").strip()[-500:]
+                except subprocess.CalledProcessError as exc:
+                    err = exc
+                    stderr_tail = (exc.stderr or "").strip()[-500:]
                     reason_code = _classify_ytdlp_failure(stderr_tail)
                     attempts.append(
                         {
-                            "strategy": f"cookies_from_browser:{selector_name}",
+                            "strategy": f"cookies_file:{cookie_label}:{selector_name}",
                             "reason_code": reason_code,
                         }
                     )
+                    if reason_code in _COOKIE_STOP_REASONS:
+                        stop_all = True
+                        break
                 except subprocess.TimeoutExpired:
                     attempts.append(
                         {
-                            "strategy": f"cookies_from_browser:{selector_name}",
+                            "strategy": f"cookies_file:{cookie_label}:{selector_name}",
                             "reason_code": "timeout",
                         }
                     )
                     reason_code = "timeout"
+                    continue
+
+                if (
+                    self._cookies_browser
+                    and reason_code in {"http_403_bot_check", "age_restricted", "private_video"}
+                ):
+                    self.log(
+                        f"[yt-dlp] retrying download with --cookies-from-browser={self._cookies_browser} "
+                        f"after reason_code={reason_code} selector={selector_name} cookie={cookie_label}"
+                    )
+                    try:
+                        subprocess.run(
+                            _build_cmd(
+                                use_browser_cookies=True,
+                                format_selector=format_selector,
+                            ),
+                            capture_output=True,
+                            text=True,
+                            check=True,
+                            timeout=_DOWNLOAD_TIMEOUT_SECONDS,
+                        )
+                        success = True
+                        break
+                    except subprocess.CalledProcessError as exc2:
+                        err = exc2
+                        stderr_tail = (exc2.stderr or "").strip()[-500:]
+                        reason_code = _classify_ytdlp_failure(stderr_tail)
+                        attempts.append(
+                            {
+                                "strategy": f"cookies_from_browser:{selector_name}",
+                                "reason_code": reason_code,
+                            }
+                        )
+                    except subprocess.TimeoutExpired:
+                        attempts.append(
+                            {
+                                "strategy": f"cookies_from_browser:{selector_name}",
+                                "reason_code": "timeout",
+                            }
+                        )
+                        reason_code = "timeout"
+
+            if success or stop_all:
+                break
+            if reason_code not in _COOKIE_RETRY_REASONS:
+                break
 
         if not success:
             return {
@@ -768,8 +834,8 @@ class AgentTools:
         """Sample frames from a downloaded candidate video. Optional [start_sec, end_sec] window.
 
         If `cache_root` is given, frames are cached under
-        ``<cache_root>/{youtube_id}_h{height}_n{num_frames}/`` (same layout as input
-        videos). Downloaded mp4 files live under ``download_output_dir`` and are not
+        ``<cache_root>/candidate/{youtube_id}_h{height}_n{num_frames}/``.
+        Downloaded mp4 files live under ``download_output_dir`` and are not
         removed when the temp workspace is cleaned."""
         if not candidate.downloaded_video_path:
             return {"ok": False, "reason": "candidate_not_downloaded", "reason_code": "candidate_not_downloaded"}
